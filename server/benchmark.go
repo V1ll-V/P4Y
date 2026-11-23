@@ -1522,8 +1522,10 @@ func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt
 						if t, ok := bm.s.m.Task(strconv.FormatInt(*ch.BoundTaskID, 10)); ok {
 							_, _ = t.Store.AddNode("fact", map[string]any{
 								"summary": "【平台 Hint 提示】" + cleanHint,
+								"detail":  cleanHint,
 								"subtype": "benchmark_hint",
 							}, 0, "confirmed", "benchmark", nil)
+							bm.broadcastHintToRunningWorkers(t, cleanHint)
 							t.Notify()
 						}
 					} else {
@@ -2047,7 +2049,7 @@ func (bm *BenchmarkManager) startChallengeSlot(ctx context.Context, rt *benchSes
 		LLMProfileIDs:        sess.LLMProfileIDs,
 		SourceTaskIDs:        prevTaskIDs,
 		TimeoutSeconds:       sess.PerChallengeTimeout,
-		PlanHeartbeatSeconds: 30,
+		PlanHeartbeatSeconds: 480,
 		ZeroTouch:            true,
 		BenchmarkSessionID:   &sid,
 	})
@@ -2326,8 +2328,29 @@ func (bm *BenchmarkManager) handleRequestHint(ctx context.Context, taskID int64,
 			"detail":  cleanHint,
 			"subtype": "benchmark_hint",
 		}, 0, "confirmed", "benchmark", nil)
+		bm.broadcastHintToRunningWorkers(t, cleanHint)
 	}
-	return "【平台官方 Hint】" + cleanHint + "\n（已同步写入探索图谱，请立即按此线索调整利用路线）", true, nil
+	return "【平台官方 Hint】" + cleanHint + "\n（已同步写入探索图谱并实时推送给所有在跑队友，请立即按此线索调整利用路线）", true, nil
+}
+
+// broadcastHintToRunningWorkers immediately delivers a newly-fetched platform Hint
+// (at most 1 per challenge) to every currently running Worker via SteerWork so active
+// sessions never spend 20+ minutes blind to an official breakthrough clue.
+func (bm *BenchmarkManager) broadcastHintToRunningWorkers(t *Task, cleanHint string) {
+	if bm == nil || bm.s == nil || bm.s.engine == nil || t == nil || t.Store == nil || strings.TrimSpace(cleanHint) == "" {
+		return
+	}
+	intents, err := t.Store.ListByKind(db.KindIntent, 100)
+	if err != nil {
+		return
+	}
+	steerMsg := "【平台官方 Hint 紧急直达（最高优先级官方线索）】\n" + strings.TrimSpace(cleanHint) +
+		"\n\n请立即结合此官方提示调整当前攻击路线；若你正在尝试与此 Hint 明显冲突的低效方向，请立刻转向！"
+	for _, it := range intents {
+		if it.State == "running" {
+			_ = bm.s.engine.SteerWork(it.ID, steerMsg)
+		}
+	}
 }
 
 // resolveBenchmarkCTFCandidates closes pending 'candidate' rows in ctf_candidates

@@ -135,13 +135,16 @@ P3Y 早期解决了安全智能体最底层的工程可靠性问题：
 - **接力与分兵**：首轮 20 分钟结束后，三路 Lead-Solver 均沉淀了完整的交接 Fact（含 Webshell、socat 转发端口、MariaDB/Redis 密钥与已排除弱口令），Planner 随即按内网拓扑自动分兵多路并发 Worker 继续推进，零重复侦察。
 - **Critic 零阻塞**：三题累计触发 17 次确定性 Critic 提醒，全程 0ms 延迟、0 阻塞 LLM 调用。
 
-### 4.2 批判性架构权衡记录（避免后续踩坑）
+### 4.2 批判性架构权衡与 v0.92 二阶纠偏落地（避免后续踩坑）
 
 1. **为什么 Web / 内网并发 Worker 的 `/work` 保持运行期隔离而非强行共享？**
    - `pwn/reverse` 单主攻互斥运行，共享 `shared/ctf-work` 无写冲突；而 Web/内网并发 Worker 同时改写 `exp.py` 或临时文件会产生竞态覆盖。当前采用“启动时继承前序快照、运行期各自隔离、下一轮自动合并”的折中方案最稳妥。
-2. **为什么暂不通过 `steerBox` 向并发队友全量广播 `record_fact`？**
-   - `steerHooks.PreToolUse` 的机制是 `block=true` 硬拦截并消费 1 轮 LLM。若将队友的每条 Fact 塞入 `steerBox`，会打断正在执行的合法工具调用（甚至拦截 `ctf_submit_flag`）、挤压 Planner 真正的高优纠偏、并因强指令语气诱导队友偏离当前职责抢活干。
-   - 如未来需要实现并发队友情报互通，**必须采用非阻塞方式**（追加在正常工具返回末尾的 1 行只读注释）+ **高价值凭据/密钥白名单过滤** + **单槽去重合并**。
+2. **为什么暂不通过 `steerBox` 向并发队友全量广播普通 `record_fact`，但必须 0-LLM 直推「平台 Hint」？**
+   - `steerHooks.PreToolUse` 的机制是 `block=true` 硬拦截并消费 1 轮 LLM。全量广播队友普通 Fact 会打断心流、诱发串台；但**平台官方 Hint（每题最多 1 条）**是最高优先级破题钥匙——在 `b-02` 实战中发现 Hint 写入图谱后在跑 Worker 长达 28 分钟未感知，因此在 **v0.92** 落地了 `broadcastHintToRunningWorkers`，收到新 Hint 立即 0-LLM `SteerWork` 直达全部在跑 Worker。
+3. **v0.92 五项二阶实战纠偏（针对 `b-01`/`b-02`/`b-03` 复盘落地）**：
+   - **双层混合 Critic + 修复 `Write/Edit` 清零停滞计数 Bug**：3 连错保持 0-LLM 极速诊断（0ms）；连续 20 步无新 Fact 停滞时恢复调用 1 次真正的 LLM 深度语义证伪（单意图上限 2 次），且 `Write`/`Edit` 不再清零 `stagnantSamples`，彻底抓住“反复改脚本死循环”；
+   - **进展感知型心跳（Progress-Aware Heartbeat）+ 20m 稳健预算**：`PlanHeartbeatSeconds` 设为 `480s`，健康推进的 Worker（运行 `< 10m` 或近 `8m` 有新确认 Fact）继续 0 心跳打扰；仅当连续停滞时放行 Planner 巡检止损，单意图上限稳健保持 `20m`；
+   - **三大实战硬红线**：Docker 网关 `.1` 默认非靶机禁爆破；认证/爆破脚本必须先做 2 次独立请求核验一次性消费与多进程一致性（Oracle Sanity Check）；Planner 多阶段最多 2 路并发禁 3 路撞车。
 
 ---
 

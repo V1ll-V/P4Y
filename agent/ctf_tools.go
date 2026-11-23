@@ -1113,26 +1113,18 @@ print("\n".join(out))`
 	return filtered
 }
 
-// ctfRunBudgetForTask ensures non-recon Lead-Solver intents have at least a 20m
-// continuous wall-clock budget (and 30m for multi-stage CTF tasks after the first
-// verified flag), while keeping recon intents bounded.
-func ctfRunBudgetForTask(ctx context.Context, workDir string, ts *db.ExplorationStore, taskID int64, phase string, base time.Duration) time.Duration {
+// ctfRunBudgetForTask ensures non-recon Lead-Solver intents have a balanced 20m
+// continuous wall-clock budget so a single session can solve end-to-end without
+// locking a stagnant multi-stage branch for 30+ minutes.
+func ctfRunBudgetForTask(_ context.Context, _ string, ts *db.ExplorationStore, taskID int64, phase string, base time.Duration) time.Duration {
 	if base <= 0 || phase == "recon" || ts == nil || taskID <= 0 {
 		return base
 	}
 	if base < 20*time.Minute {
-		base = 20 * time.Minute
+		return 20 * time.Minute
 	}
-	if base >= 30*time.Minute {
-		return base
-	}
-	pg := ts.Database()
-	if pg == nil {
-		return base
-	}
-	prog, err := ctf.New(workDir, pg).Progress(ctx, taskID)
-	if err == nil && prog.AcceptedFlagCount >= 1 {
-		return 30 * time.Minute
+	if base > 20*time.Minute {
+		return 20 * time.Minute
 	}
 	return base
 }

@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"p3y/db"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/norma/transcript"
 )
 
 const ctfCriticSystem = `【思考与输出语言规范】请全程使用简体中文进行简短犀利的反向证伪分析（专有术语与路径除外）。
@@ -37,14 +39,16 @@ type ctfCriticHooks struct {
 	threshold         int
 	stagnantThreshold int
 	advisor           CriticAdvisor
+	deepAdvisor       CriticAdvisor
 	emit              func(db.Activity)
 
-	mu              sync.Mutex
-	failures        []criticFailureSample
-	stagnantSamples []criticFailureSample
-	stagnantWarned  bool
-	pendingCritique string
-	critiqueCount   int
+	mu                sync.Mutex
+	failures          []criticFailureSample
+	stagnantSamples   []criticFailureSample
+	stagnantWarned    bool
+	pendingCritique   string
+	critiqueCount     int
+	deepCritiqueCount int
 }
 
 // deterministicCTFCriticAdvice generates an instant, zero-LLM, zero-latency
@@ -77,10 +81,35 @@ func deterministicCTFCriticAdvice(dossier string) string {
 	}
 }
 
-func newCTFCriticHooks(inner harness.HookRunner, _ llm.Provider, pg *db.DB, taskID, intentID int64, emit func(db.Activity)) *ctfCriticHooks {
-	advisor := CriticAdvisor(func(_ context.Context, dossier string) (string, error) {
+func newCTFCriticHooks(inner harness.HookRunner, prov llm.Provider, pg *db.DB, taskID, intentID int64, emit func(db.Activity)) *ctfCriticHooks {
+	fastAdvisor := CriticAdvisor(func(_ context.Context, dossier string) (string, error) {
 		return deterministicCTFCriticAdvice(dossier), nil
 	})
+	var deepAdvisor CriticAdvisor
+	if prov != nil {
+		roleProv := withRoleThinking(prov, "critic", "", true)
+		deepAdvisor = CriticAdvisor(func(ctx context.Context, dossier string) (string, error) {
+			if roleProv == nil {
+				return "", fmt.Errorf("no provider")
+			}
+			cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			if transcript.SessionIDFrom(cctx) == "" && taskID > 0 {
+				cctx = transcript.WithSessionID(cctx, fmt.Sprintf("task%d-critic-i%d", taskID, intentID))
+			}
+			msg, _, _, err := roleProv.Complete(cctx, llm.CompletionRequest{
+				System:    []string{ctfCriticSystem},
+				MaxTokens: 700,
+				Messages: []llm.Message{
+					{Role: llm.RoleUser, Content: []llm.ContentBlock{llm.TextBlock(dossier)}},
+				},
+			})
+			if err != nil {
+				return "", err
+			}
+			return strings.TrimSpace(msg.Text()), nil
+		})
+	}
 	return &ctfCriticHooks{
 		inner:             inner,
 		pg:                pg,
@@ -88,7 +117,8 @@ func newCTFCriticHooks(inner harness.HookRunner, _ llm.Provider, pg *db.DB, task
 		intentID:          intentID,
 		threshold:         3,
 		stagnantThreshold: 20,
-		advisor:           advisor,
+		advisor:           fastAdvisor,
+		deepAdvisor:       deepAdvisor,
 		emit:              emit,
 	}
 }
@@ -234,9 +264,12 @@ func (h *ctfCriticHooks) PostToolUse(ctx context.Context, name string, input, re
 	if h.inner != nil {
 		h.inner.PostToolUse(ctx, name, input, result, isErr)
 	}
+	// Only genuine progress/pivot events reset stagnation tracking.
+	// Write/Edit MUST NOT reset stagnantSamples so repeated "edit brute script -> fail -> edit"
+	// loops still trigger deep stagnation falsification.
 	if (name == "record_fact" || name == "board_mark_savepoint" ||
 		name == "board_rewind" || name == "plateau_fork" ||
-		name == "Write" || name == "Edit" || name == "ctf_submit_flag" || name == "ctf_submit_exploit_proof") && !isErr {
+		name == "ctf_submit_flag" || name == "ctf_submit_exploit_proof") && !isErr {
 		h.mu.Lock()
 		h.stagnantSamples = nil
 		h.stagnantWarned = false
@@ -312,7 +345,21 @@ func (h *ctfCriticHooks) PostToolUse(ctx context.Context, name string, input, re
 
 	dossier := h.buildDossier(ctx, snapshot)
 	critiqueText := ""
-	if h.advisor != nil {
+	useDeep := false
+	if reasonKind == "停滞无新线索产出" && h.deepAdvisor != nil {
+		h.mu.Lock()
+		if h.deepCritiqueCount < 2 {
+			h.deepCritiqueCount++
+			useDeep = true
+		}
+		h.mu.Unlock()
+	}
+	if useDeep {
+		if txt, err := h.deepAdvisor(ctx, dossier); err == nil && strings.TrimSpace(txt) != "" {
+			critiqueText = strings.TrimSpace(txt)
+		}
+	}
+	if critiqueText == "" && h.advisor != nil {
 		if txt, err := h.advisor(ctx, dossier); err == nil && strings.TrimSpace(txt) != "" {
 			critiqueText = strings.TrimSpace(txt)
 		}

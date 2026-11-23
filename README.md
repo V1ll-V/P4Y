@@ -92,8 +92,8 @@
    # 1) 构建前端并编译主二进制
    cd web && npm ci && npm run build:static && cd ..
    rm -rf server/webui/dist && cp -r web/out server/webui/dist
-   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -ldflags='-s -w -X main.version=v0.91' -o dist/amd64/p3y ./cmd/p3y
-   docker build -t p3y/p3y:v0.91 .
+   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -ldflags='-s -w -X main.version=v0.92' -o dist/amd64/p3y ./cmd/p3y
+   docker build -t p3y/p3y:v0.92 .
 
    # 2) 构建执行器 p3y-box 与 VPN / 工具镜像
    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags='-s -w' -o dist/amd64/p3y-box ./cmd/p3y-box

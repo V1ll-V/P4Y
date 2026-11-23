@@ -59,7 +59,7 @@ export function P3YLogo({ variant = "mark", className }: P3YLogoProps) {
           <path d="M51 31L64 25L77 31" stroke="currentColor" strokeOpacity="0.55" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
         <div className="flex flex-col items-center gap-1">
-          <span className="font-bold text-3xl tracking-[0.34em] pl-[0.34em]">P3Y</span>
+          <span className="font-bold text-3xl tracking-[0.34em] pl-[0.34em]">P4Y</span>
           <span className="font-mono text-[10px] tracking-[0.28em] pl-[0.28em] opacity-65">AUTONOMOUS SECURITY</span>
         </div>
       </div>

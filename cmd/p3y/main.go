@@ -27,17 +27,17 @@ import (
 var version = "dev"
 
 const banner = `
- ____  _____ __   __
-|  _ \|___ / \ \ / /
-| |_) | |_ \  \ V /
-|  __/ ___) |  | |
-|_|   |____/   |_|
+ ____  _  _  __   __
+|  _ \| || | \ \ / /
+| |_) | || |_ \ V /
+|  __/|__   _| | |
+|_|      |_|   |_|
 `
 
 // printBanner writes the startup banner + version/runtime info to stdout.
 func printBanner(addr string) {
 	fmt.Print(banner)
-	fmt.Println("  P3Y 智能攻防与解题系统")
+	fmt.Println("  P4Y 智能攻防与解题系统")
 	fmt.Printf("  版本 %s  ·  %s/%s  ·  %s  ·  监听 %s\n\n",
 		version, runtime.GOOS, runtime.GOARCH, runtime.Version(), addr)
 }

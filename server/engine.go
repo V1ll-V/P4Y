@@ -923,9 +923,12 @@ func shouldSkipHeartbeatForPausedIntents(store *db.ExplorationStore) bool {
 	return hasPaused
 }
 
-// shouldSkipHeartbeatForCTFRunning suppresses periodic heartbeat Planner LLM calls
-// while a CTF Lead-Solver Worker is actively executing. The Planner still wakes
-// immediately on edge events (worker completion/exhaustion, hints, or rejections).
+// shouldSkipHeartbeatForCTFRunning implements progress-aware heartbeat silencing:
+// while CTF Workers are actively executing, skip periodic Planner heartbeat LLM calls
+// as long as running intents are either young (< 10m) or the task produced a confirmed
+// non-origin Fact within the last 8m. If any running intent has been running >= 10m
+// with >= 8m of zero new Facts, allow the heartbeat through so Planner can inspect
+// and steer_work / kill_work stagnant branches.
 func shouldSkipHeartbeatForCTFRunning(store *db.ExplorationStore) bool {
 	if store == nil {
 		return false
@@ -934,9 +937,29 @@ func shouldSkipHeartbeatForCTFRunning(store *db.ExplorationStore) bool {
 	if err != nil {
 		return false
 	}
+	now := time.Now()
+	hasRunning := false
+	hasOldRunning := false
 	for _, it := range intents {
 		if it.State == "running" {
-			return true
+			hasRunning = true
+			if !it.CreatedAt.IsZero() && now.Sub(it.CreatedAt) >= 10*time.Minute {
+				hasOldRunning = true
+			}
+		}
+	}
+	if !hasRunning {
+		return false
+	}
+	if !hasOldRunning {
+		return true
+	}
+	facts, ferr := store.ListByKind(db.KindFact, 10)
+	if ferr == nil {
+		for _, f := range facts {
+			if f.State == "confirmed" && !f.CreatedAt.IsZero() && now.Sub(f.CreatedAt) < 8*time.Minute {
+				return true
+			}
 		}
 	}
 	return false

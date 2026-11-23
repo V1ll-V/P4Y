@@ -17,7 +17,7 @@ services:
     restart: unless-stopped
 
   p3y:
-    image: p3y/p3y:v0.91
+    image: p3y/p3y:v0.92
     depends_on:
       postgres:
         condition: service_healthy
