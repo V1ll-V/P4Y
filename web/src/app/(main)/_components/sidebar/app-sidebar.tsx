@@ -4,7 +4,6 @@ import Link from "next/link";
 
 import { useShallow } from "zustand/react/shallow";
 
-import { P3YLogo } from "@/components/p3y-logo";
 import {
   Sidebar,
   SidebarContent,
@@ -38,14 +37,21 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
 
   return (
     <Sidebar {...props} variant={variant} collapsible={collapsible}>
-      <SidebarHeader>
+      <SidebarHeader className="border-b border-sidebar-border/80 pb-3">
         <SidebarMenu>
           <SidebarMenuItem>
-            <SidebarMenuButton asChild>
-              <Link prefetch={false} href="/function/tasks">
-                <P3YLogo variant="mark" className="size-7 shrink-0" />
-                <span className="font-semibold text-base tracking-tight">{APP_CONFIG.name}</span>
-                <span className="text-muted-foreground text-xs">{APP_CONFIG.displayVersion}</span>
+            <SidebarMenuButton asChild size="lg" className="hover:bg-sidebar-accent/70">
+              <Link prefetch={false} href="/dashboard" className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="flex size-7 shrink-0 items-center justify-center rounded-md border border-border bg-card font-mono text-[11px] font-bold tracking-tight">
+                    {APP_CONFIG.name}
+                  </div>
+                  <div className="flex flex-col leading-tight min-w-0">
+                    <span className="font-semibold text-sm tracking-tight truncate">{APP_CONFIG.name}</span>
+                    <span className="font-mono text-[11px] text-muted-foreground">{APP_CONFIG.displayVersion}</span>
+                  </div>
+                </div>
+                <span className="size-2 shrink-0 rounded-full bg-emerald-500" title="System Online" />
               </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>
