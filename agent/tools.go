@@ -464,6 +464,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		if len(recentFacts) >= recentFactsCap {
 			break
 		}
+		if n.State == "dismissed" || (isCTFMode && n.State == "origin") {
+			continue // 已证伪/被替代的旧信念退出活跃视图；CTF 下 origin 已在顶层 task 字段展示
+		}
 		if hidden(n.ID) {
 			continue // 已折进 digest 且仍冷 —— 见 cold_digests
 		}
@@ -491,12 +494,40 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	}
 	out["recent_facts"] = recentFacts
 	// recent_done_intents：非折叠的已结束意图里最新的一窗（≤N，recentDone 已按 id 降序）。
-	// 更早的看 done_intents_total 计数 + node_detail(id)。
+	// 附带 blocked_reason 与收尾轮产出的单行 result_summary，使后续接力与规划者直接看见
+	// 前序分支为何结束、排除了哪些死路、停在哪个卡点，减少跨意图失忆与重复踩坑。
 	const recentDoneCap = 12
 	if len(recentDone) > recentDoneCap {
 		recentDone = recentDone[:recentDoneCap]
 	}
-	out["recent_done_intents"] = compactIntents(recentDone, parentsOf, yieldsOf)
+	recentDoneCompact := compactIntents(recentDone, parentsOf, yieldsOf)
+	for i, intent := range recentDone {
+		if br := strings.TrimSpace(intent.BlockedReason); br != "" {
+			recentDoneCompact[i]["blocked_reason"] = singleLineTrunc(br, 160)
+		}
+		if acts, _, err := t.ts.ActivityPageForTerminalIntent(intent.ID, 0, 12); err == nil {
+			var resultSummary, textFallback string
+			for _, activity := range acts {
+				switch activity.Kind {
+				case "result":
+					if s := strings.TrimSpace(activity.Summary); s != "" {
+						resultSummary = s
+					}
+				case "text":
+					if s := strings.TrimSpace(activity.Summary); s != "" {
+						textFallback = s
+					}
+				}
+			}
+			if resultSummary == "" {
+				resultSummary = textFallback
+			}
+			if resultSummary != "" {
+				recentDoneCompact[i]["result_summary"] = singleLineTrunc(resultSummary, 240)
+			}
+		}
+	}
+	out["recent_done_intents"] = recentDoneCompact
 	// cold-digest §6.1: 折叠冷区的 digest body，按最新成员时间降序取前 N；被截的更旧 digest
 	// 只给裸 id（仍可 expand_digest 展开），避免冷区唯一出口被无限拉长。
 	const coldDigestsCap = 15
@@ -1069,7 +1100,7 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if t.ts != nil {
 		if mode, challenge, _, err := t.ts.TaskInputMetadata(); err == nil && db.IsSandboxTaskMode(mode) {
 			ch := strings.ToLower(strings.TrimSpace(challenge))
-			if ch == "pwn" || ch == "reverse" {
+			if ch == "pwn" || ch == "reverse" || ch == "crypto" {
 				existing, _ := t.ts.ListByKind(db.KindIntent, 100)
 				for _, en := range existing {
 					if en.State != "open" && en.State != "running" && en.State != "paused" {
@@ -1344,19 +1375,103 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 // must NOT be stuffed into the asset graph via upsert_asset.
 // factItem 是 record_fact 批量/单条的一条事实。
 type factItem struct {
-	Summary    string            `json:"summary"`
-	Detail     string            `json:"detail"`
-	Evidence   string            `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
-	Confidence string            `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
-	IntentID   json.RawMessage   `json:"intent_id"`
-	AssetIDs   []json.RawMessage `json:"asset_ids"`
+	Summary           string            `json:"summary"`
+	Detail            string            `json:"detail"`
+	Evidence          string            `json:"evidence"`            // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
+	Confidence        string            `json:"confidence"`          // observed（直接看到）| inferred（据现象推断）
+	IntentID          json.RawMessage   `json:"intent_id"`
+	AssetIDs          []json.RawMessage `json:"asset_ids"`
+	SupersedesFactIDs []json.RawMessage `json:"supersedes_fact_ids"` // 可选：被新证据证伪/替代的旧 fact id，将自动标记为 dismissed 退出活跃视图
+}
+
+func normalizeFactText(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(s)), " "))
+}
+
+// findDuplicateConfirmedFact performs exact normalized dedup against active
+// confirmed facts in the same exploration so identical outputs or repeated
+// discoveries from concurrent workers do not crowd out recent_facts.
+func (t *ToolSet) findDuplicateConfirmedFact(summary, detail string) int64 {
+	if t.ts == nil {
+		return 0
+	}
+	normSum := normalizeFactText(summary)
+	normDet := normalizeFactText(detail)
+	if normSum == "" && normDet == "" {
+		return 0
+	}
+	existing, err := t.ts.ListByKind(db.KindFact, 200)
+	if err != nil {
+		return 0
+	}
+	for _, n := range existing {
+		if n.State != "confirmed" {
+			continue
+		}
+		var p map[string]any
+		if json.Unmarshal(n.Payload, &p) != nil {
+			continue
+		}
+		exSum, _ := p["summary"].(string)
+		exDet, _ := p["detail"].(string)
+		exNormSum := normalizeFactText(exSum)
+		exNormDet := normalizeFactText(exDet)
+		if normSum != "" && normSum == exNormSum && (normDet == "" || normDet == exNormDet) {
+			return n.ID
+		}
+		if normDet != "" && len([]rune(normDet)) >= 40 && normDet == exNormDet {
+			return n.ID
+		}
+	}
+	return 0
+}
+
+func (t *ToolSet) dismissSupersededFacts(newFactID int64, ids []int64) {
+	if t.ts == nil || len(ids) == 0 {
+		return
+	}
+	for _, oldID := range ids {
+		if oldID <= 0 || oldID == newFactID {
+			continue
+		}
+		// Only dismiss local confirmed facts in this exploration (never mutate inherited source tasks).
+		oldNode, err := t.ts.GetNode(oldID)
+		if err != nil || oldNode == nil || oldNode.Kind != db.KindFact || oldNode.State != "confirmed" {
+			continue
+		}
+		_ = t.ts.SetNodeState(oldID, "dismissed")
+	}
 }
 
 // recordOneFact 写一条 fact 节点并连到意图（intent→yields→fact）。defaultIntent 为
 // 批量时的默认意图（本条未给 intent_id 时用）。
 func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error) {
+	id, _, err := t.recordOneFactDetailed(it, defaultIntent)
+	return id, err
+}
+
+func (t *ToolSet) recordOneFactDetailed(it factItem, defaultIntent int64) (int64, bool, error) {
 	if strings.TrimSpace(it.Summary) == "" {
-		return 0, fmt.Errorf("summary 不能为空")
+		return 0, false, fmt.Errorf("summary 不能为空")
+	}
+	intent := pid(it.IntentID)
+	if intent <= 0 {
+		intent = defaultIntent
+	}
+	if intent > 0 {
+		node, err := t.ts.GetNode(intent)
+		if err != nil || node == nil || node.Kind != db.KindIntent {
+			return 0, false, fmt.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）")
+		}
+	}
+	supersedes := pidList(it.SupersedesFactIDs)
+	if dupID := t.findDuplicateConfirmedFact(it.Summary, it.Detail); dupID > 0 {
+		if intent > 0 {
+			_ = t.ts.Link(intent, db.RelYields, dupID)
+		}
+		t.dismissSupersededFacts(dupID, supersedes)
+		t.writes.Facts++
+		return dupID, true, nil
 	}
 	payload := map[string]any{"summary": it.Summary}
 	if it.Detail != "" {
@@ -1368,26 +1483,20 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	if c := strings.TrimSpace(it.Confidence); c != "" {
 		payload["confidence"] = c
 	}
-	intent := pid(it.IntentID)
-	if intent <= 0 {
-		intent = defaultIntent
-	}
-	if intent > 0 {
-		node, err := t.ts.GetNode(intent)
-		if err != nil || node == nil || node.Kind != db.KindIntent {
-			return 0, fmt.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）")
-		}
+	if len(supersedes) > 0 {
+		payload["supersedes_fact_ids"] = supersedes
 	}
 	// a fact is its OWN node kind (distinct from a vuln finding).
 	id, err := t.ts.AddNode(db.KindFact, payload, 5, "confirmed", t.worker, pidList(it.AssetIDs))
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if intent > 0 {
 		_ = t.ts.Link(intent, db.RelYields, id) // chain: intent -> fact
 	}
+	t.dismissSupersededFacts(id, supersedes)
 	t.writes.Facts++
-	return id, nil
+	return id, false, nil
 }
 
 func (t *ToolSet) recordFact() actool.CoreTool {
@@ -1397,15 +1506,17 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 		"⚠️只写你在工具输出里【真实看到】的结论，不要脑补。evidence 与 confidence 用来防止不准确的结论污染图谱：\n"+
 		"  · evidence=支撑本结论的【一行】关键证据（命令+最能证明的那一两行输出），**务必简洁**——细节已在 detail，这里不要再粘大段输出。\n"+
 		"  · confidence=observed（输出里直接看到）| inferred（据现象推断）。\n"+
-		"  · **否定类结论**（不可注入/端口关闭/未发现入口等）只写\"观察 + 试探性读法\"——陈述你实际看到什么，方向是否放弃由规划者综合全局定；务必给 evidence，手段没穷尽或证据弱（含只探一次、看起来像）标 inferred，确已穷尽且直接看到才标 observed。",
+		"  · **否定类结论**（不可注入/端口关闭/未发现入口等）只写\"观察 + 试探性读法\"——陈述你实际看到什么，方向是否放弃由规划者综合全局定；务必给 evidence，手段没穷尽或证据弱（含只探一次、看起来像）标 inferred，确已穷尽且直接看到才标 observed。\n"+
+		"  · 若新实证推翻了某条旧 fact 的判断，可传 supersedes_fact_ids 将旧 fact 标为 dismissed（保留审计，退出活跃视图）。",
 		obj(map[string]any{
-			"facts":      map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段（summary/detail/evidence/confidence/intent_id/asset_ids）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
-			"intent_id":  idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
-			"detail":     str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
-			"evidence":   str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
-			"confidence": str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
+			"facts":               map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段（summary/detail/evidence/confidence/intent_id/asset_ids/supersedes_fact_ids）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"summary":             str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
+			"intent_id":           idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
+			"detail":              str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
+			"evidence":            str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
+			"confidence":          str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
+			"asset_ids":           map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
+			"supersedes_fact_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选：被本事实以新证据证伪/替代的旧 fact id 列表，将自动标为 dismissed 退出活跃视图"},
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -1421,19 +1532,24 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 			defaultIntent := pid(a.factItem.IntentID) // 顶层 intent_id = 批量默认
 
 			ids := make([]int64, len(items))
+			dedupedFlags := make([]bool, len(items))
 			errs := map[string]string{}
 			for i, it := range items {
-				id, err := t.recordOneFact(it, defaultIntent)
+				id, deduped, err := t.recordOneFactDetailed(it, defaultIntent)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
 				}
 				ids[i] = id
+				dedupedFlags[i] = deduped
 			}
 
-			if !batch { // 单条：保持原返回
+			if !batch { // 单条：保持原返回前缀兼容
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
+				}
+				if dedupedFlags[0] {
+					return actool.Text(fmt.Sprintf("fact recorded: %d (已存在相同事实 #%d，已幂等复用，请勿重复写入)", ids[0], ids[0])), nil
 				}
 				return actool.Text(fmt.Sprintf("fact recorded: %d", ids[0])), nil
 			}

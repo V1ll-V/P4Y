@@ -188,7 +188,7 @@ func taskInputContextForRole(root string, ts *db.ExplorationStore, taskID, inten
 			b.WriteString("本意图续跑保持该输入快照；新附件由规划者分派后续意图处理。\n")
 		}
 	}
-	if db.IsSandboxTaskMode(mode) && intentID > 0 && root != "" && ts != nil {
+	if db.IsSandboxTaskMode(mode) && root != "" && ts != nil {
 		if recent := ctf.New(root, ts.Database()).RecentWorkArtifacts(context.Background(), taskID, intentID, 12); len(recent) > 0 {
 			fmt.Fprintf(&b, "\n【/work 已有产物（最近修改 Top %d，可直接复用，无需重复解包或重算）】\n", len(recent))
 			for _, item := range recent {
@@ -201,12 +201,12 @@ func taskInputContextForRole(root string, ts *db.ExplorationStore, taskID, inten
 
 func ctfPlannerStrategyHint(challenge string) string {
 	switch strings.ToLower(strings.TrimSpace(challenge)) {
-	case "pwn", "reverse":
-		return "【Pwn/Reverse 编排要求】：采用「轻量并发前置(phase=recon) → 动静合一核心求解(phase=exploit)」模式。第1步仅派1~2个短平快 recon 意图（解包/保护检查/环境与远程握手抓菜单与PoW），写完 fact 即收工；收齐后只派1个动静合一主攻意图，严禁将静态分析与动态调试拆进两个Worker，严禁在主线未失败前并排派发备用EXP抢跑，且后续意图须复用已有目录与环境路径。"
+	case "pwn", "reverse", "crypto":
+		return "【Pwn/Reverse/Crypto 编排要求】：强串行深度题默认单主攻「动静合一核心求解(phase=exploit)」连贯推进（系统已 0-LLM 直发主攻，无需另派前置 recon 或并行辅助意图抢跑）；局部脏活由主攻内部调用 ask_helper 完成；仅在前一主攻 exhausted/blocked 后再派接续主攻，并明确要求复用 /work 已有脚本、反编译与环境产物。"
 	case "web":
-		return "【Web 编排要求】：可充分发挥多 Worker 并行广度优势，开局按接口探测/源码泄露排查/重点漏洞猜测拆为 2~3 个互不依赖的平行意图。"
+		return "【Web 编排要求】：单服务/单站点 Web 题默认保持 1 条 phase=exploit 主攻深度跟进，避免多 Worker 撞车重复探测同一入口；仅在明确发现多个独立存活主机或独立服务端点（如内网横向多靶机、前后端独立端口）时，才按互斥目标边界（IP:Port/模块）最多并行 2 路分兵。"
 	default:
-		return "请结合下方附件与态势决定并发拆分策略：互不依赖的表面侦察可并行派发；强因果耦合的分析与本地/远程联调应归入同一主攻意图，避免重复搭建环境。"
+		return "请结合下方附件与态势决定并发拆分策略：单靶机/强因果耦合分析默认保持单主攻连贯推进；仅在发现多个独立主机/服务（如多阶段内网）时才按互斥目标边界并行分兵（最多 2 路），避免重复搭建环境或同质化撞车。"
 	}
 }
 

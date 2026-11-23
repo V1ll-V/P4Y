@@ -1113,20 +1113,26 @@ print("\n".join(out))`
 	return filtered
 }
 
-// ctfRunBudgetForTask ensures non-recon Lead-Solver intents have a balanced 20m
-// continuous wall-clock budget so a single session can solve end-to-end without
-// locking a stagnant multi-stage branch for 30+ minutes.
+// ctfRunBudgetForTask assigns differentiated wall-clock budgets for non-recon
+// Lead-Solver intents:
+//   - Deep sequential categories (pwn / reverse / crypto): 30m to avoid repeated
+//     mid-exploit context-wipe relays on complex binary/math problems.
+//   - Broad / multi-stage categories (web / misc / auto): 20m so stagnant
+//     intranet/web branches settle and pivot promptly.
+// Task-level deadlines (e.g. Hosted Benchmark 1200s) still clamp this budget
+// via clampMaxDuration.
 func ctfRunBudgetForTask(_ context.Context, _ string, ts *db.ExplorationStore, taskID int64, phase string, base time.Duration) time.Duration {
 	if base <= 0 || phase == "recon" || ts == nil || taskID <= 0 {
 		return base
 	}
-	if base < 20*time.Minute {
-		return 20 * time.Minute
+	target := 20 * time.Minute
+	if _, challenge, _, err := ts.TaskInputMetadata(); err == nil {
+		switch strings.ToLower(strings.TrimSpace(challenge)) {
+		case "pwn", "reverse", "crypto":
+			target = 30 * time.Minute
+		}
 	}
-	if base > 20*time.Minute {
-		return 20 * time.Minute
-	}
-	return base
+	return target
 }
 
 // Legacy run-directory instructions are superseded by the CTF execution scope.

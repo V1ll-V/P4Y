@@ -54,7 +54,7 @@ const ctfPlannerSystem = `【思考与输出语言规范】你的所有内部思
 1. **接续与换道（严禁盲目重复）**：
    - 主攻意图 "exhausted" 且已逼近突破（如已泄露地址或写好 "/work/exp.py" 差最后一步）→ 传 "parent_ids" 派发 1 条接续主攻意图（"phase=\"exploit\""），要求直接复用 "/work/exp.py" 与 "/work/notes.md" 接着打穿；
    - 主攻卡死在错误方向或收到 "【平台 Hint 提示】" → 立即按 Hint 或全新攻击面派发 1 条明确换道的主攻意图（"phase=\"exploit\""），必要时用 "kill_work" 停止偏离主线的在跑意图；
-   - 禁止在 Pwn/Reverse 主攻意图处于 "open/running/paused" 时另开并行意图抢跑（系统会拒绝）；多阶段内网分兵**严格最多 2 路并发**（仅限明确不同 IP/服务的真实业务靶机，严禁对 Docker 网关 ".1" 派发爆破意图），已有 2 路 "running" 时严禁再开第 3 路撞车，如需换道必须先 "kill_work" 止损；局部多路分析交由主攻内部 "ask_helper(tasks=[...])" 完成。
+   - 禁止在 Pwn/Reverse/Crypto 主攻意图处于 "open/running/paused" 时另开并行意图抢跑（系统会拒绝）；多阶段内网分兵**严格最多 2 路并发**（仅限明确不同 IP/服务的真实业务靶机，且每条意图 summary 必须标明各自互斥的目标 IP:Port 或服务边界，严禁对 Docker 网关 ".1" 派发爆破意图），已有 2 路 "running" 时严禁再开第 3 路撞车，如需换道必须先 "kill_work" 止损；局部多路分析交由主攻内部 "ask_helper(tasks=[...])" 完成。
 2. **严禁停摆底线与暂停保护**：
    - 若 "paused_intents" 非空（用户接管），勿派同类抢跑意图；
    - 仅当目标未达成、当前无待确认候选（"pending_count=0"）且无任何 "open / running / paused" 意图时，本轮【必须】调用 "add_intent" 至少派发 1 个新主攻意图。
@@ -74,7 +74,7 @@ const ctfGoalsSystem = `【思考与输出语言规范】思考推理（Thinking
 只有用户明确要求多个独立 Flag 或明确的「先 Flag 后漏洞利用」多阶段交付时才按需拆分。不要增加覆盖率、资产枚举或漏洞报告要求。
 【本阶段边界说明】当前为第 0 轮目标登记阶段，系统在此阶段刻意仅挂载 set_goals 与 set_constraints；下方列出的附件清单与分析执行能力将在本轮完成后、进入第 1 轮规划并派发 Worker 智能体后自动启用。请勿在本轮尝试读取或解压附件，严禁新增“探测执行环境 / 检查工具 / 临时探测”等过程性目标；调用一次 set_goals 登记最终目标后即简短确认并结束本轮。`
 
-const ctfSettlePrompt = `停止新的探测。执行日志和脚本已自动保存；不要补资产登记、漏洞报告或目标验收。请先检查是否已将本轮关键状态写入图谱：若尚有未写回的存活入口/Webshell/本地转发端口、已获凭据、已排除的路径或凭据区间（多阶段任务中尤为重要），请调用一次 record_fact 写清交接上下文以便后续 Worker 零重复接棒；已有候选（Flag 或漏洞利用证明）只给出核心内容和来源执行，提示用户提交平台验证；若处于无需 Flag 的漏洞利用证明模式且效果已验证，可调用 ctf_submit_exploit_proof 登记证明后结束；最后用一句话总结当前进展与下一步阻塞点，然后结束。`
+const ctfSettlePrompt = `停止新的探测。执行日志和脚本已自动保存；不要补资产登记、漏洞报告或目标验收。请先检查是否已将本轮关键交接状态写入图谱：若尚有未写回的内容，请调用一次 record_fact 按三要素写清交接快照——(1) 已就绪产物（/work 下可直接复用、禁止重建的脚本/反编译/存活入口/凭据/转发端口）；(2) 已证伪死路（Deadends：排除的路径/假设/凭据区间及证据，若推翻了旧 fact 请填 supersedes_fact_ids）；(3) 下一步唯一卡点。已有候选（Flag 或漏洞利用证明）只给出核心内容和来源执行，提示用户提交平台验证；若处于无需 Flag 的漏洞利用证明模式且效果已验证，可调用 ctf_submit_exploit_proof 登记证明后结束；最后单独用一句话纯文本总结「已完成进展 + 已排除死路 + 下一步卡点」，然后结束。`
 
 func isCTFContext(ctx context.Context) bool {
 	ctf, _ := ctx.Value(ctfRunKey{}).(bool)

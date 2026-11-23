@@ -515,7 +515,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		settle = wrapupSettlementForTask("worker", ctfExecutionTools, clamped)
 	}
 	if ctfMode {
-		settle = &harness.Settlement{Prompt: ctfSettlePrompt, MaxTurns: 1, DisabledTools: ctfExecutionTools}
+		// MaxTurns=2 (with all execution tools disabled) guarantees the worker can
+		// call record_fact on turn 1 and emit its one-line handoff result_summary on turn 2.
+		settle = &harness.Settlement{Prompt: ctfSettlePrompt, MaxTurns: 2, DisabledTools: ctfExecutionTools}
 	}
 	workerProv := withRoleThinking(w.prov, "worker", "", false)
 	if ctfMode && phase == "recon" {
