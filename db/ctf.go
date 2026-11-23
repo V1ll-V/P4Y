@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 )
@@ -349,6 +350,109 @@ func (d *DB) BenchmarkTaskFlagProgress(ctx context.Context, taskID, expID int64)
 	var distinctAccepted int
 	_ = d.QueryRowContext(ctx, `SELECT COUNT(DISTINCT c.value) FROM ctf_candidates c JOIN tasks t ON t.id=c.task_id WHERE c.task_id=$1 AND c.input_hash=t.ctf_input_hash AND c.state='accepted' AND c.kind<>'exploit_proof'`, taskID).Scan(&distinctAccepted)
 	return max(correctFlags, distinctAccepted), reqFlags, true
+}
+
+// BenchmarkTaskTargetScope returns the explicit entry IPv4 addresses belonging
+// to a benchmark task (allowedIPs), the entry IPv4 addresses of OTHER challenges
+// in the same benchmark session (siblingIPs), and any CIDR blocks explicitly
+// mentioned in this challenge's description (explicitCIDRs) so callers never
+// block a range the challenge itself asks to scan. ok=false for non-benchmark tasks.
+func (d *DB) BenchmarkTaskTargetScope(ctx context.Context, taskID int64) (allowedIPs []string, siblingIPs []string, explicitCIDRs []string, ok bool) {
+	if d == nil || taskID <= 0 {
+		return nil, nil, nil, false
+	}
+	var sessionID, chID int64
+	var rawAddrs []byte
+	var desc string
+	err := d.QueryRowContext(ctx, `SELECT session_id, id, container_addr, COALESCE(description,'') FROM benchmark_challenges WHERE bound_task_id=$1 OR $1 = ANY(history_task_ids) ORDER BY id DESC LIMIT 1`, taskID).Scan(&sessionID, &chID, &rawAddrs, &desc)
+	if err != nil {
+		return nil, nil, nil, false
+	}
+	extractHostIPv4 := func(raw string) string {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			return ""
+		}
+		if idx := strings.Index(s, "://"); idx >= 0 {
+			s = s[idx+3:]
+		}
+		if idx := strings.IndexAny(s, "/?# "); idx >= 0 {
+			s = s[:idx]
+		}
+		if host, _, splitErr := net.SplitHostPort(s); splitErr == nil {
+			s = host
+		}
+		ip := net.ParseIP(strings.TrimSpace(s))
+		if ip == nil {
+			return ""
+		}
+		v4 := ip.To4()
+		if v4 == nil {
+			return ""
+		}
+		return v4.String()
+	}
+
+	allowedSet := map[string]bool{}
+	var addrs []string
+	if json.Unmarshal(rawAddrs, &addrs) == nil {
+		for _, a := range addrs {
+			if ip := extractHostIPv4(a); ip != "" && !allowedSet[ip] {
+				allowedSet[ip] = true
+				allowedIPs = append(allowedIPs, ip)
+			}
+		}
+	}
+	// Fallback to task precheck targets if container_addr was empty/cleared.
+	if len(allowedIPs) == 0 {
+		if preRaw, perr := d.TaskPrecheck(ctx, taskID); perr == nil && len(preRaw) > 0 {
+			var pre struct {
+				Targets []string `json:"targets"`
+			}
+			if json.Unmarshal(preRaw, &pre) == nil {
+				for _, t := range pre.Targets {
+					if ip := extractHostIPv4(t); ip != "" && !allowedSet[ip] {
+						allowedSet[ip] = true
+						allowedIPs = append(allowedIPs, ip)
+					}
+				}
+			}
+		}
+	}
+	// Extract any explicit CIDR ranges mentioned in the challenge description.
+	for _, field := range strings.FieldsFunc(desc, func(r rune) bool {
+		return !(r >= '0' && r <= '9' || r == '.' || r == '/')
+	}) {
+		if strings.Count(field, "/") == 1 {
+			if _, ipnet, cerr := net.ParseCIDR(field); cerr == nil && ipnet != nil {
+				explicitCIDRs = append(explicitCIDRs, ipnet.String())
+			}
+		}
+	}
+
+	// Collect sibling challenge entry IPs in the same benchmark session (Level 1 blocklist).
+	siblingSet := map[string]bool{}
+	rows, qerr := d.QueryContext(ctx, `SELECT container_addr FROM benchmark_challenges WHERE session_id=$1 AND id<>$2 AND jsonb_array_length(container_addr) > 0`, sessionID, chID)
+	if qerr == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var sibRaw []byte
+			if rows.Scan(&sibRaw) != nil {
+				continue
+			}
+			var sibAddrs []string
+			if json.Unmarshal(sibRaw, &sibAddrs) != nil {
+				continue
+			}
+			for _, a := range sibAddrs {
+				if ip := extractHostIPv4(a); ip != "" && !allowedSet[ip] && !siblingSet[ip] {
+					siblingSet[ip] = true
+					siblingIPs = append(siblingIPs, ip)
+				}
+			}
+		}
+	}
+	return allowedIPs, siblingIPs, explicitCIDRs, true
 }
 
 func (d *DB) CTFTaskIDsForWP(ctx context.Context) ([]int64, error) {

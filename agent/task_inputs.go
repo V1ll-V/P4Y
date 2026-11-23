@@ -80,6 +80,11 @@ func taskInputContextForRole(root string, ts *db.ExplorationStore, taskID, inten
 			}
 			if ts.Database().IsZeroTouchTask(taskID) {
 				b.WriteString("\n【零交互自动测评模式已开启】：当前处于无人值守自动测评赛道，严禁等待人工介入或人工确认！\n- 若命令 stdout/stderr 出现标准 Flag，系统会自动提交至测评平台并写入探索板。\n- 若为非标准 Flag 或多 Flag 题目（需指定 `sub_flag_id`），请直接调用 `ctf_submit_flag`。\n- 若为客观选择题，请调用 `benchmark_submit_choice`。\n- 若提交判定 `wrong`：请立即分析原因并调整策略，严禁重复提交同一被否决答案；若判定 `partial`（多 Flag），请继续寻找其余未完成子 Flag。\n")
+				if sg := resolveCTFTargetScopeGuard(context.Background(), ts.Database(), taskID); sg != nil {
+					if blk := sg.RenderPromptBlock(); blk != "" {
+						b.WriteString(blk)
+					}
+				}
 				if BenchmarkContextHook != nil {
 					if bctx := BenchmarkContextHook(context.Background(), taskID, role); bctx != "" {
 						b.WriteString(bctx)

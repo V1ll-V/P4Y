@@ -1074,6 +1074,25 @@ func (bm *BenchmarkManager) stopBoundTask(taskID, terminalStatus string, cause e
 	}
 }
 
+// shouldNotifyPlannerAfterBenchmarkVerdict avoids waking the Planner mid-flight
+// when a multi-flag challenge accepts a partial stage Flag while a Lead-Solver
+// Worker is already actively running (preventing noisy steer_work interruptions).
+func shouldNotifyPlannerAfterBenchmarkVerdict(store *db.ExplorationStore, correct, completed bool, totalFlags int) bool {
+	if !correct || completed || totalFlags <= 1 || store == nil {
+		return true
+	}
+	intents, err := store.ListByKind(db.KindIntent, 100)
+	if err != nil {
+		return true
+	}
+	for _, it := range intents {
+		if it.State == "running" {
+			return false
+		}
+	}
+	return true
+}
+
 func (bm *BenchmarkManager) runSessionLoop(ctx context.Context, sessionID int64, rt *benchSessionRuntime) {
 	defer func() {
 		if bm != nil && bm.s != nil && bm.s.ctx != nil && bm.s.ctx.Err() == nil && os.Getenv("P3Y_BENCH_EXIT_ON_DONE") == "1" {
@@ -2589,7 +2608,9 @@ func (bm *BenchmarkManager) submitToPlatform(ctx context.Context, sess *db.Bench
 				"correct": false,
 			}, 0, "confirmed", "benchmark", nil)
 		}
-		t.Notify()
+		if shouldNotifyPlannerAfterBenchmarkVerdict(t.Store, res.Correct, completed, totalFlags) {
+			t.Notify()
+		}
 	}
 
 	if res.Correct {

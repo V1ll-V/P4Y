@@ -105,8 +105,11 @@ def probe_target(target_str, timeout=10.0):
         return res
 
     banner_bytes = b""
+    banner_timed_out = False
     sock.settimeout(min(2.5, timeout))
     try: banner_bytes = sock.recv(8192)
+    except socket.timeout:
+        banner_timed_out = True
     except Exception: pass
 
     if banner_bytes:
@@ -175,6 +178,13 @@ def probe_target(target_str, timeout=10.0):
         res["suggested_command"] = f"openssl s_client -connect {host}:{port} -quiet"
     else:
         res["suggested_command"] = f"nc {host} {port}"
+    if res["tcp_connected"] and not res["banner"] and not res["tls_supported"] and banner_timed_out:
+        res["warning"] = (
+            "TCP handshake succeeded but 0 bytes received before read timeout. "
+            "In VPN/proxy environments this may indicate a transparent proxy fake-handshake or silent packet drop "
+            "(not a real live service). Probe an unlikely random port (e.g. 54321) on the same IP as a negative control "
+            "before attempting brute-force or protocol exploits."
+        )
     return res
 
 if __name__ == "__main__":

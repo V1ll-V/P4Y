@@ -580,6 +580,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		}
 		ctfGate = &ctfSubmissionProvider{Provider: opts.Provider, pg: ts.Database(), taskID: taskID}
 		opts.Provider = ctfGate
+		if ts != nil {
+			if scopeGuard := resolveCTFTargetScopeGuard(ctx, ts.Database(), taskID); scopeGuard != nil {
+				baseHooks = ctfScopeGuardHooks{inner: baseHooks, guard: scopeGuard}
+			}
+		}
 		opts.Hooks = ctfSubmissionHooks{inner: baseHooks, gate: ctfGate}
 	}
 	if w.tx != nil { // persist raw LLM conversation; one file per worked intent
