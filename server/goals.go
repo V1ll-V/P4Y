@@ -71,6 +71,11 @@ func (s *Server) startTaskEngine(t *Task) {
 	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
 		return
 	}
+	if t.Mode == "ctf" {
+		if has, _ := t.Store.HasActiveIntent(); !has {
+			s.seedCTFLeadSolverIntent(t)
+		}
+	}
 	s.engine.Run(s.ctx, t)
 }
 
@@ -386,10 +391,10 @@ func (s *Server) createGoals(ctx context.Context, t *Task, emit func(db.Activity
 	if t == nil {
 		return nil
 	}
-	// Zero-touch benchmark tasks carry a deterministic platform-generated goal and
-	// never require LLM extraction of human allow/deny operational constraints.
-	// Materialize the single goal node directly without spending a Round-0 LLM call.
-	if t.ZeroTouch {
+	// Zero-touch benchmark and CTF/AD sandbox tasks carry a well-defined challenge goal
+	// and never require a Round-0 LLM call to decompose operational constraints.
+	// Materialize the single goal node directly with zero LLM latency.
+	if t.ZeroTouch || db.IsSandboxTaskMode(t.Mode) {
 		if g := strings.TrimSpace(t.Goal); g != "" {
 			origin, _ := t.Store.OriginFactID()
 			id, err := t.Store.AddNode(db.KindGoal, map[string]any{"text": g}, 0, "open", "system", nil)

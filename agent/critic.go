@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"p3y/db"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/transcript"
 )
 
 const ctfCriticSystem = `【思考与输出语言规范】请全程使用简体中文进行简短犀利的反向证伪分析（专有术语与路径除外）。
@@ -49,28 +47,39 @@ type ctfCriticHooks struct {
 	critiqueCount   int
 }
 
-func newCTFCriticHooks(inner harness.HookRunner, prov llm.Provider, pg *db.DB, taskID, intentID int64, emit func(db.Activity)) *ctfCriticHooks {
-	roleProv := withRoleThinking(prov, "critic", "", true)
-	advisor := CriticAdvisor(func(ctx context.Context, dossier string) (string, error) {
-		if roleProv == nil {
-			return "", fmt.Errorf("no provider")
-		}
-		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		defer cancel()
-		if transcript.SessionIDFrom(cctx) == "" && taskID > 0 {
-			cctx = transcript.WithSessionID(cctx, fmt.Sprintf("task%d-critic-i%d", taskID, intentID))
-		}
-		msg, _, _, err := roleProv.Complete(cctx, llm.CompletionRequest{
-			System:    []string{ctfCriticSystem},
-			MaxTokens: 700,
-			Messages: []llm.Message{
-				{Role: llm.RoleUser, Content: []llm.ContentBlock{llm.TextBlock(dossier)}},
-			},
-		})
-		if err != nil {
-			return "", err
-		}
-		return strings.TrimSpace(msg.Text()), nil
+// deterministicCTFCriticAdvice generates an instant, zero-LLM, zero-latency
+// falsification nudge from recent failure/stagnation signatures so normal exploit
+// iteration is never blocked by a 20-second synchronous Critic LLM call.
+func deterministicCTFCriticAdvice(dossier string) string {
+	low := strings.ToLower(dossier)
+	switch {
+	case strings.Contains(low, "502 bad gateway") ||
+		strings.Contains(low, "connection refused") ||
+		strings.Contains(low, "connectionrefusederror") ||
+		strings.Contains(low, "failed to establish a new connection") ||
+		strings.Contains(low, "operation timed out") ||
+		strings.Contains(low, "connection timed out"):
+		return "1. 核心前提核查：目标上游服务连续不可达/超时或已被打崩，严禁对死连接重复跑扫描或长 sleep 轮询。\n2. 最小证伪实验：先用单次 ctf_probe_target / ctf_http 核对真实端口与存活状态；若主端口确已失效，检查是否存在其他入口端口或内网路径。\n3. 止损动作：确认靶机彻底不可达时立即 record_fact 写明现象并结束本轮。"
+	case strings.Contains(low, "segmentation fault") ||
+		strings.Contains(low, "sigsegv") ||
+		strings.Contains(low, "stack smashing") ||
+		strings.Contains(low, "eoferror") ||
+		strings.Contains(low, "brokenpipeerror"):
+		return "1. 核心前提核查：Exploit 触发进程崩溃或远端断开，常见原因包括 64 位 16B 栈对齐（MOVAPS 需补 ret gadget）、偏移/libc 版本失配、或输入缓冲/换行符与远程菜单不一致。\n2. 最小证伪实验：立即用 diff_local_remote 对比本地与远程回显，或在 ctf_gdb / py_repl 中停在崩溃点核验 RSP 对齐与实际泄露地址，禁止盲改偏移重试。\n3. 切换动作：把已排除的偏移写入 /work/notes.md，确认泄漏地址后再发最终 payload。"
+	case strings.Contains(low, "403 forbidden") ||
+		strings.Contains(low, "404 not found") ||
+		strings.Contains(low, "405 method") ||
+		strings.Contains(low, "401 unauthorized") ||
+		strings.Contains(low, "waf"):
+		return "1. 核心前提核查：当前 HTTP 请求连续遭遇权限拦截或路径不存在，继续在同路径/同参数微调收益极低。\n2. 最小证伪实验：改用 http_fuzz_diff 做小批量差分测试，切换请求方法、Header、Cookie、Content-Type 或回看源码鉴权/路由解析逻辑。\n3. 切换动作：可用 ask_helper(tasks=[...]) 并行审计其他源码路由或调用 tips_search 查找同框架绕过技巧。"
+	default:
+		return "1. 核心前提核查：连续多步未获有效进展，当前攻击假设或脚本前提大概率存在偏差。\n2. 最小证伪实验：用 1 步对照实验直接验证最底层假设（如核验活体靶机真实行为、用 py_repl 单独验证算法/编解码、或用 ctf_decompile 复查关键函数）。\n3. 切换动作：将已证伪路径记入 /work/notes.md，换用不同攻击面或用 ask_helper(tasks=[...]) 并行排查其余线索。"
+	}
+}
+
+func newCTFCriticHooks(inner harness.HookRunner, _ llm.Provider, pg *db.DB, taskID, intentID int64, emit func(db.Activity)) *ctfCriticHooks {
+	advisor := CriticAdvisor(func(_ context.Context, dossier string) (string, error) {
+		return deterministicCTFCriticAdvice(dossier), nil
 	})
 	return &ctfCriticHooks{
 		inner:             inner,

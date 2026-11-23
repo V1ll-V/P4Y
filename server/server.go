@@ -1887,6 +1887,10 @@ func (s *Server) seed(t *Task, text string) {
 // origin fact (RelDerivedFrom) so it still traces back to a fact node. Best-effort —
 // a failure just falls back to the normal planner-driven flow.
 func (s *Server) seedFirstIntent(t *Task) {
+	if t != nil && t.Mode == "ctf" {
+		s.seedCTFLeadSolverIntent(t)
+		return
+	}
 	summary := fmt.Sprintf("完成任务目标：%s（任务：%s）", t.Goal, t.Description)
 	id, err := t.Store.AddIntent(map[string]any{"summary": summary}, 8, nil, "seed")
 	if err != nil {
@@ -1897,6 +1901,32 @@ func (s *Server) seedFirstIntent(t *Task) {
 		_ = t.Store.Link(origin, db.RelDerivedFrom, id)
 	}
 	log.Printf("[seed] task %s: 已下发种子意图 #%d", t.ID, id)
+}
+
+// seedCTFLeadSolverIntent seeds a single long-horizon Lead-Solver exploit intent
+// directly after Phase-0 Precheck so the CTF Worker launches on Turn 1 with zero
+// Planner LLM round-trip and retains continuous memory from triage through exploit.
+func (s *Server) seedCTFLeadSolverIntent(t *Task) {
+	if t == nil || t.Store == nil {
+		return
+	}
+	summary := fmt.Sprintf("Lead-Solver 全流程解题（先核验 Phase-0 Precheck 与活体靶机回显，再在统一 /work 持续分析、编写 /work/exp.py 并拿下 Flag）：%s", strings.TrimSpace(t.Goal))
+	if len([]rune(summary)) > 480 {
+		summary = string([]rune(summary)[:480]) + "…"
+	}
+	payload := map[string]any{
+		"summary": summary,
+		"phase":   "exploit",
+	}
+	id, err := t.Store.AddIntent(payload, 8, nil, "seed")
+	if err != nil {
+		log.Printf("[seed] task %s: 下发 CTF Lead-Solver 主攻意图失败: %v", t.ID, err)
+		return
+	}
+	if origin, _ := t.Store.OriginFactID(); origin > 0 {
+		_ = t.Store.Link(origin, db.RelDerivedFrom, id)
+	}
+	log.Printf("[seed] task %s: 已直发 CTF Lead-Solver 主攻意图 #%d（0-LLM 启动）", t.ID, id)
 }
 
 func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {

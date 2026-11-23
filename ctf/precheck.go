@@ -654,11 +654,10 @@ func (s *Service) RunPrecheck(ctx context.Context, taskID int64, force bool) (*P
 	}
 
 	var sumParts []string
-	fmt.Fprintf(&strings.Builder{}, "")
 	sumParts = append(sumParts, fmt.Sprintf("type=%s (inferred=%s)", taskRow.ChallengeType, inferred))
 	sumParts = append(sumParts, fmt.Sprintf("files=%d", len(files)))
 	if len(targets) > 0 {
-		sumParts = append(sumParts, "targets="+strings.Join(targets, ","))
+		sumParts = append(sumParts, "[LIVE TARGET PRESENT: "+strings.Join(targets, ",")+"]")
 	}
 	if len(tags) > 0 {
 		sumParts = append(sumParts, "tags=["+strings.Join(tags, ",")+"]")

@@ -222,6 +222,9 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 			log.Printf("[tools] seed %s 失败: %v", s.Key, err)
 		}
 	}
+	// Remove explicitly retired built-in system tools (e.g. ctf_python, replaced by Bash/py_repl)
+	// without ever touching user-defined custom tools (system=false).
+	_, _ = pg.Exec(`DELETE FROM tools WHERE system=true AND key IN ('ctf_python')`)
 	repairCtx, cancelRepair := context.WithTimeout(context.Background(), 5*time.Second)
 	if n, err := pg.RepairNullToolProperties(repairCtx); err != nil {
 		log.Printf("[tools] repair null properties: %v", err)

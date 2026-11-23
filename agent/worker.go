@@ -330,10 +330,19 @@ func intentPhase(intent *db.Node) string {
 }
 
 func ctfMaxTurnsForPhase(ctfMode bool, phase string, configured int) int {
-	if ctfMode && phase == "recon" {
+	if !ctfMode {
+		return configured
+	}
+	if phase == "recon" {
 		if configured == 0 || configured > 16 {
 			return 16
 		}
+		return configured
+	}
+	// Lead-Solver / exploit intents need a generous continuous turn budget so a
+	// single session can complete triage + live probe + exploit debugging end-to-end.
+	if configured > 0 && configured < 80 {
+		return 80
 	}
 	return configured
 }
@@ -347,14 +356,34 @@ func renderIntentTask(intent *db.Node) string {
 // must NOT widen the worker's job — it still does only its assigned intent. Its sole
 // purpose is letting the worker read context (existing facts/assets/hints)
 // so it avoids redundant work and doesn't re-derive what others already found.
-func renderWorkerGraphOverview(data map[string]any) string {
+// stripEnterpriseKeysForCTF removes enterprise-pentest-only overview fields
+// (always zero/empty in CTF mode) so CTF Solver/Planner contexts have higher
+// signal-to-noise ratio.
+func stripEnterpriseKeysForCTF(data map[string]any) {
+	if data == nil {
+		return
+	}
+	delete(data, "findings_total")
+	delete(data, "candidates_total")
+	delete(data, "finding_list")
+	delete(data, "awaiting_goal_evaluations")
+	delete(data, "coverage")
+}
+
+func renderWorkerGraphOverview(data map[string]any, ctfMode ...bool) string {
 	// coverage 是给规划者判断「哪类测得少 / 要不要扩范围」的信号，与 worker「只做领到的
 	// 那条意图、别追未覆盖的点」的职责边界相悖 → 从 worker 视图里剔除。data 是本次 worker
 	// 专属的新 map，删键不影响 planner。
 	delete(data, "coverage")
+	if len(ctfMode) > 0 && ctfMode[0] {
+		stripEnterpriseKeysForCTF(data)
+	}
 	b, err := json.Marshal(data)
 	if err != nil {
 		return "" // fall back silently: the worker just won't have the global context
+	}
+	if len(ctfMode) > 0 && ctfMode[0] {
+		return "\n\n【全局探索态势（CTF 精简高信噪比视图；recent_facts 已内联 detail/evidence）】：\n" + string(b)
 	}
 	return "\n\n【全局探索态势（只读，帮你把自己这条意图放进大局看）】：\n" +
 		"下面是整个任务当前的探索概况。用途有两个：一是知道别人已发现什么，别重复；二是让你探自己这条意图时，能联想到它和全局的关系。\n" +
@@ -428,8 +457,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
-	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
 	ctfMode := isCTFContext(ctx)
+	overview := renderWorkerGraphOverview(tsx.graphOverviewData(), ctfMode)
 	phase := ""
 	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, w.workDir)
 	if ctfMode {

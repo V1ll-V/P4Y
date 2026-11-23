@@ -105,6 +105,47 @@ func (s *Service) hostBindPath(localPath string) string {
 }
 func Hash(m artifacts.Manifest) string { b, _ := json.Marshal(m); return SHA(b) }
 func SHA(b []byte) string              { sum := sha256.Sum256(b); return hex.EncodeToString(sum[:]) }
+type syncCacheEntry struct {
+	inputsMod int64
+	syncedAt  time.Time
+}
+
+type scriptSnapCacheEntry struct {
+	sig     string
+	scripts []Script
+}
+
+var (
+	syncedTaskCache sync.Map // key: root|taskID -> syncCacheEntry
+	scriptSnapCache sync.Map // key: workDir -> scriptSnapCacheEntry
+)
+
+func (s *Service) taskInputsModTime(id int64) int64 {
+	if s == nil || s.Root == "" || id <= 0 {
+		return 0
+	}
+	p := filepath.Join(s.Root, "tasks", strconv.FormatInt(id, 10), "inputs")
+	if info, err := os.Stat(p); err == nil {
+		return info.ModTime().UnixNano()
+	}
+	return 0
+}
+
+func (s *Service) ensureSynced(ctx context.Context, id int64) error {
+	if s == nil || id <= 0 {
+		return nil
+	}
+	cacheKey := s.Root + "|" + strconv.FormatInt(id, 10)
+	mod := s.taskInputsModTime(id)
+	if v, ok := syncedTaskCache.Load(cacheKey); ok {
+		entry := v.(syncCacheEntry)
+		if entry.inputsMod == mod && time.Since(entry.syncedAt) < 2*time.Minute {
+			return nil
+		}
+	}
+	return s.Sync(ctx, id)
+}
+
 func (s *Service) Sync(ctx context.Context, id int64) error {
 	m, err := (artifacts.Store{Root: s.Root}).Inputs(id, 0)
 	if err != nil {
@@ -112,12 +153,14 @@ func (s *Service) Sync(ctx context.Context, id int64) error {
 	}
 	if mode, _, err := s.DB.TaskChallengeType(ctx, id); err == nil && strings.EqualFold(strings.TrimSpace(mode), "ad") {
 		_, _ = s.RunPrecheck(ctx, id, false)
+		syncedTaskCache.Store(s.Root+"|"+strconv.FormatInt(id, 10), syncCacheEntry{inputsMod: s.taskInputsModTime(id), syncedAt: time.Now()})
 		return nil
 	}
 	if err := s.DB.SyncCTFInput(ctx, id, Hash(m)); err != nil {
 		return err
 	}
 	_, _ = s.RunPrecheck(ctx, id, false)
+	syncedTaskCache.Store(s.Root+"|"+strconv.FormatInt(id, 10), syncCacheEntry{inputsMod: s.taskInputsModTime(id), syncedAt: time.Now()})
 	return nil
 }
 func (s *Service) WorkDir(task, intent int64) string {
@@ -288,15 +331,15 @@ func (s *Service) sessionKey(ctx context.Context, task, intent int64) (string, s
 }
 
 func (s *Service) prepareSession(ctx context.Context, task, intent int64) (string, ctfrunner.Session, artifacts.Manifest, string, error) {
-	sessionIntent, work, _, shared := s.resolveScope(ctx, task, intent)
+	sessionIntent, work, _, _ := s.resolveScope(ctx, task, intent)
 	store := artifacts.Store{Root: s.Root}
 	m, err := store.Inputs(task, sessionIntent)
 	if err != nil {
 		return "", ctfrunner.Session{}, m, "", err
 	}
-	if !shared {
-		seedNonSharedWorkDir(s.Root, task, work, s.ancestorTaskIDs(task)...)
-	}
+	// Seed newly-created work directories for BOTH shared (pwn/reverse retries) and
+	// non-shared scopes so retry rounds inherit ancestor /work scripts and artifacts.
+	seedNonSharedWorkDir(s.Root, task, work, s.ancestorTaskIDs(task)...)
 	if err = os.MkdirAll(work, 0700); err != nil {
 		return "", ctfrunner.Session{}, m, "", err
 	}
@@ -350,7 +393,7 @@ func (s *Service) execute(ctx context.Context, task, intent int64, command strin
 	sessionIntent, _, lockKey, _ := s.resolveScope(ctx, task, intent)
 	unlock := executionLock(lockKey)
 	defer unlock()
-	if err := s.Sync(ctx, task); err != nil {
+	if err := s.ensureSynced(ctx, task); err != nil {
 		return nil, err
 	}
 	if enforcePendingCheck {
@@ -425,7 +468,7 @@ func (s *Service) execute(ctx context.Context, task, intent int64, command strin
 	e.StderrSHA = SHA(result.Stderr)
 	e.StdoutExcerpt = excerpt(result.Stdout, 16000)
 	e.StderrExcerpt = excerpt(result.Stderr, 8000)
-	files, err := snapshotScripts(work, dir)
+	files, err := s.snapshotScriptsCached(task, work, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -461,7 +504,7 @@ func (s *Service) StartJob(ctx context.Context, task, intent int64, command, job
 	sessionIntent, _, lockKey, _ := s.resolveScope(ctx, task, intent)
 	unlock := executionLock(lockKey)
 	defer unlock()
-	if err := s.Sync(ctx, task); err != nil {
+	if err := s.ensureSynced(ctx, task); err != nil {
 		return nil, err
 	}
 	if pending, err := s.DB.PendingCTFSubmission(ctx, task); err != nil {
@@ -1077,6 +1120,71 @@ type Script struct {
 	Size   int64  `json:"size"`
 }
 
+func snapshotScriptsSignature(work string) (string, error) {
+	var parts []string
+	err := filepath.WalkDir(work, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if p != work {
+				switch strings.ToLower(d.Name()) {
+				case ".inputs", ".cache", ".config", ".ghidra", ".jobs", ".interactive", ".snapshots", ".tools", "__pycache__", ".git", "node_modules":
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(p))
+		if ext != ".py" && ext != ".sh" && ext != ".gdb" && ext != ".c" && ext != ".js" && ext != ".txt" {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Size() > 128<<10 || len(parts) >= 32 {
+			return nil
+		}
+		name, _ := filepath.Rel(work, p)
+		parts = append(parts, fmt.Sprintf("%s|%d|%d", filepath.ToSlash(name), info.Size(), info.ModTime().UnixNano()))
+		return nil
+	})
+	return strings.Join(parts, "\n"), err
+}
+
+func (s *Service) snapshotScriptsCached(task int64, work, dir string) ([]Script, error) {
+	sig, err := snapshotScriptsSignature(work)
+	if err != nil {
+		return snapshotScripts(work, dir)
+	}
+	if v, ok := scriptSnapCache.Load(work); ok {
+		entry := v.(scriptSnapCacheEntry)
+		if entry.sig == sig {
+			allExist := true
+			taskRoot := filepath.Join(s.Root, "tasks", strconv.FormatInt(task, 10))
+			for _, sc := range entry.scripts {
+				if _, serr := os.Stat(filepath.Join(taskRoot, filepath.FromSlash(sc.Path))); serr != nil {
+					allExist = false
+					break
+				}
+			}
+			if allExist {
+				out := make([]Script, len(entry.scripts))
+				copy(out, entry.scripts)
+				return out, nil
+			}
+		}
+	}
+	out, err := snapshotScripts(work, dir)
+	if err == nil {
+		cached := make([]Script, len(out))
+		copy(cached, out)
+		scriptSnapCache.Store(work, scriptSnapCacheEntry{sig: sig, scripts: cached})
+	}
+	return out, err
+}
+
 func snapshotScripts(work, dir string) ([]Script, error) {
 	out := []Script{}
 	err := filepath.WalkDir(work, func(p string, d fs.DirEntry, err error) error {
@@ -1084,6 +1192,12 @@ func snapshotScripts(work, dir string) ([]Script, error) {
 			return err
 		}
 		if d.IsDir() {
+			if p != work {
+				switch strings.ToLower(d.Name()) {
+				case ".inputs", ".cache", ".config", ".ghidra", ".jobs", ".interactive", ".snapshots", ".tools", "__pycache__", ".git", "node_modules":
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(p))

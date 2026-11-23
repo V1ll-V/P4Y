@@ -36,12 +36,13 @@ type benchSessionRuntime struct {
 	platformEnvCap   int
 	extraTools       []actool.CoreTool
 	toolsLoaded      bool
-	lastEnvPoll      map[string]time.Time
-	taskStartAt      map[string]time.Time
-	lastFlagAt       map[string]time.Time
-	lastHintAttempt  map[string]time.Time
-	startingCodes    map[string]bool
-	singleWatch      map[string]context.CancelFunc
+	lastEnvPoll          map[string]time.Time
+	taskStartAt          map[string]time.Time
+	lastFlagAt           map[string]time.Time
+	lastHintAttempt      map[string]time.Time
+	momentumGraceGranted map[string]bool
+	startingCodes        map[string]bool
+	singleWatch          map[string]context.CancelFunc
 }
 
 // BenchmarkManager orchestrates unattended zero-touch multi-platform benchmark
@@ -65,6 +66,7 @@ func (s *Server) registerBenchmarkHooks() {
 	}
 	ctf.BenchmarkFlagHook = s.bench.handleFlagCandidate
 	agent.BenchmarkChoiceHook = s.bench.handleChoice
+	agent.BenchmarkHintHook = s.bench.handleRequestHint
 	agent.BenchmarkExtraToolsHook = s.bench.extraToolsForTask
 	agent.BenchmarkContextHook = s.bench.contextForTask
 	go s.bench.resumeRunningSessions()
@@ -90,7 +92,10 @@ const (
 	maxBenchmarkAutoRetries          = 3
 	defaultHostedBenchAutoRetries    = 5
 	defaultHostedBenchTimeoutSec     = 5400
-	defaultHostedFirstPassTimeoutSec = 600 // 托管模式首轮快筛预算（10 分钟），快速扫完简单题后再进入二轮完整预算攻坚
+	defaultHostedFirstPassTimeoutSec = 1200 // 托管模式首轮预算（20 分钟），给足单会话 Lead-Solver 一气呵成解题窗口
+	benchmarkMomentumGraceDuration   = 600 * time.Second
+	benchmarkMomentumRecentWindow    = 180 * time.Second
+	benchmarkActiveHintMinElapsed    = 8 * time.Minute
 )
 
 func isHostedBenchmarkMode() bool {
@@ -214,14 +219,16 @@ func (bm *BenchmarkManager) runtimeFor(sess *db.BenchmarkSession) (*benchSession
 		return nil, err
 	}
 	rt := &benchSessionRuntime{
-		sessionID:     sess.ID,
-		prov:          prov,
-		cfg:           cfg,
-		lastEnvPoll:   map[string]time.Time{},
-		taskStartAt:   map[string]time.Time{},
-		lastFlagAt:    map[string]time.Time{},
-		startingCodes: map[string]bool{},
-		singleWatch:   map[string]context.CancelFunc{},
+		sessionID:            sess.ID,
+		prov:                 prov,
+		cfg:                  cfg,
+		lastEnvPoll:          map[string]time.Time{},
+		taskStartAt:          map[string]time.Time{},
+		lastFlagAt:           map[string]time.Time{},
+		lastHintAttempt:      map[string]time.Time{},
+		momentumGraceGranted: map[string]bool{},
+		startingCodes:        map[string]bool{},
+		singleWatch:          map[string]context.CancelFunc{},
 	}
 	bm.runs[sess.ID] = rt
 	return rt, nil
@@ -1535,15 +1542,34 @@ func (bm *BenchmarkManager) checkChallengeTimeoutAndHint(ctx context.Context, rt
 			}
 		}
 	}
-	if timeout > 0 && elapsed > timeout && hasWaiting {
+	bm.mu.Lock()
+	graceAlreadyGranted := rt.momentumGraceGranted != nil && rt.momentumGraceGranted[ch.UniqueCode]
+	bm.mu.Unlock()
+	effectiveTimeout := timeout
+	if graceAlreadyGranted && effectiveTimeout > 0 {
+		effectiveTimeout += benchmarkMomentumGraceDuration
+	}
+	if effectiveTimeout > 0 && elapsed > effectiveTimeout && hasWaiting {
+		if !graceAlreadyGranted && (ch.CorrectFlagCount > 0 || bm.hasRecentChallengeMomentum(ctx, *ch.BoundTaskID, benchmarkMomentumRecentWindow)) {
+			bm.mu.Lock()
+			if rt.momentumGraceGranted == nil {
+				rt.momentumGraceGranted = map[string]bool{}
+			}
+			rt.momentumGraceGranted[ch.UniqueCode] = true
+			bm.mu.Unlock()
+			_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "challenge_momentum_grace",
+				fmt.Sprintf("题目 %s 临近超时但检测到活跃破题动量（近 3 分钟产出新事实或已获部分 Flag），自动宽限 +%ds 避免临门一脚错杀", ch.UniqueCode, int(benchmarkMomentumGraceDuration.Seconds())),
+				map[string]any{"elapsed_sec": int(elapsed.Seconds()), "grace_sec": int(benchmarkMomentumGraceDuration.Seconds()), "correct_flags": ch.CorrectFlagCount})
+			return false
+		}
 		taskID := strconv.FormatInt(*ch.BoundTaskID, 10)
 		stopReason := "单题预算超时，让出并发槽位"
-		evtMsg := fmt.Sprintf("题目 %s 超过单题时间预算（%ds），已释放槽位调度后续题目", ch.UniqueCode, int(timeout.Seconds()))
-		retryReason := fmt.Sprintf("单题预算超时（%ds）", int(timeout.Seconds()))
+		evtMsg := fmt.Sprintf("题目 %s 超过单题时间预算（%ds），已释放槽位调度后续题目", ch.UniqueCode, int(effectiveTimeout.Seconds()))
+		retryReason := fmt.Sprintf("单题预算超时（%ds）", int(effectiveTimeout.Seconds()))
 		if isFirstPass {
 			stopReason = "首轮快筛预算到期，让出槽位优先筛查其余新题"
-			evtMsg = fmt.Sprintf("题目 %s 首轮快筛到期（%ds），已保留探索记忆并释放槽位，后续将使用完整预算（%ds）深度攻坚", ch.UniqueCode, int(timeout.Seconds()), sess.PerChallengeTimeout)
-			retryReason = fmt.Sprintf("首轮快筛到期（%ds，转二轮完整预算 %ds）", int(timeout.Seconds()), sess.PerChallengeTimeout)
+			evtMsg = fmt.Sprintf("题目 %s 首轮预算到期（%ds），已保留探索记忆并释放槽位，后续将使用完整预算（%ds）深度攻坚", ch.UniqueCode, int(effectiveTimeout.Seconds()), sess.PerChallengeTimeout)
+			retryReason = fmt.Sprintf("首轮预算到期（%ds，转二轮完整预算 %ds）", int(effectiveTimeout.Seconds()), sess.PerChallengeTimeout)
 		}
 		bm.stopBoundTask(taskID, "timeout", errors.New(stopReason))
 		if ch.ContainerStatus == "available" || ch.ContainerStatus == "pending" {
@@ -1657,6 +1683,27 @@ func (bm *BenchmarkManager) isChallengeStagnant(ctx context.Context, taskID int6
 		if err := bm.s.m.pg.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM activity WHERE exploration_id=$1 AND kind='critic')`, t.ExpID).Scan(&hasCritic); err == nil && hasCritic {
 			return true
 		}
+	}
+	return false
+}
+
+// hasRecentChallengeMomentum reports whether taskID recorded a new confirmed
+// (non-origin) Fact within window, indicating active solving momentum.
+func (bm *BenchmarkManager) hasRecentChallengeMomentum(ctx context.Context, taskID int64, window time.Duration) bool {
+	if bm == nil || bm.s == nil || bm.s.m == nil || bm.s.m.pg == nil || taskID <= 0 || window <= 0 {
+		return false
+	}
+	t, ok := bm.s.m.Task(strconv.FormatInt(taskID, 10))
+	if !ok || t == nil || t.ExpID <= 0 {
+		return false
+	}
+	var hasRecent bool
+	cutoff := time.Now().Add(-window)
+	if err := bm.s.m.pg.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM exploration_nodes
+		WHERE exploration_id=$1 AND kind='fact' AND state='confirmed' AND created_at >= $2
+	)`, t.ExpID, cutoff).Scan(&hasRecent); err == nil && hasRecent {
+		return true
 	}
 	return false
 }
@@ -2042,10 +2089,14 @@ func (bm *BenchmarkManager) startChallengeSlot(ctx context.Context, rt *benchSes
 	}
 	bm.mu.Lock()
 	rt.taskStartAt[ch.UniqueCode] = time.Now()
+	if rt.momentumGraceGranted != nil {
+		delete(rt.momentumGraceGranted, ch.UniqueCode)
+	}
 	bm.mu.Unlock()
 
 	bm.s.prewarmTaskVPN(t, vpnHash, vpnCfg)
-	// seedFirstIntent = false: let Planner run round 1 immediately to create branch intents.
+	// Direct Lead-Solver: startTaskEngine seeds a long-horizon phase="exploit" intent
+	// immediately after Phase-0 Precheck so Worker launches on Turn 1 with 0 Planner LLM lag.
 	bm.s.launchTask(t, goal, false)
 	eventMsg := fmt.Sprintf("题目已分配槽位并启动零交互求解（子任务 #%s）", t.ID)
 	if len(prevTaskIDs) > 0 {
@@ -2196,6 +2247,87 @@ func (bm *BenchmarkManager) handleChoice(ctx context.Context, taskID int64, choi
 		UniqueCode: ch.UniqueCode,
 		Choice:     choices,
 	}, answerText)
+}
+
+// handleRequestHint lets an active benchmark Lead-Solver request the platform Hint
+// when genuinely stuck, protected by an 8-minute anti-laziness gate (unless already
+// stagnant) and global per-challenge idempotency.
+func (bm *BenchmarkManager) handleRequestHint(ctx context.Context, taskID int64, reason string) (string, bool, error) {
+	sess, ch, err := bm.s.m.pg.FindBenchmarkByTaskID(ctx, taskID)
+	if err != nil || sess == nil || ch == nil {
+		return "", false, nil
+	}
+	if ch.HintUsed {
+		if clean := strings.TrimSpace(ch.HintContent); clean != "" {
+			return "【已缓存的平台 Hint】" + clean, true, nil
+		}
+		return "本题此前已向平台查询过 Hint，平台未配置可用 Hint，请换向独立突破。", true, nil
+	}
+	if sess.HintPolicy == "never" {
+		return "当前测评会话已将 hint_policy 设为 never（禁用 Hint），请独立解题。", true, nil
+	}
+	rt, err := bm.runtimeFor(sess)
+	if err != nil {
+		return "", true, err
+	}
+	bm.mu.Lock()
+	started := rt.taskStartAt[ch.UniqueCode]
+	bm.mu.Unlock()
+	if started.IsZero() {
+		if t, ok := bm.s.m.Task(strconv.FormatInt(taskID, 10)); ok {
+			snap := t.lifecycleSnapshot()
+			if snap.FirstRunAt > 0 {
+				started = time.Unix(snap.FirstRunAt, 0)
+			} else if t.CreatedAt > 0 {
+				started = time.Unix(t.CreatedAt, 0)
+			}
+		}
+	}
+	elapsed := time.Duration(0)
+	if !started.IsZero() {
+		elapsed = time.Since(started)
+	}
+	if elapsed < benchmarkActiveHintMinElapsed && !bm.isChallengeStagnant(ctx, taskID) {
+		remSec := int((benchmarkActiveHintMinElapsed - elapsed).Seconds())
+		if remSec < 1 {
+			remSec = 1
+		}
+		return fmt.Sprintf("【Hint 门禁拦截】本题当前仅运行 %d 秒（未满 %d 分钟防偷懒门禁且未触发停滞），暂不允许拉取扣分 Hint。请先完成活体探测、附件核心逻辑排查或并行 ask_helper 审计（还需 %d 秒后可再次申请）。",
+			int(elapsed.Seconds()), int(benchmarkActiveHintMinElapsed/time.Minute), remSec), true, nil
+	}
+
+	hint, herr := rt.prov.GetHint(ctx, ch.UniqueCode)
+	if herr != nil {
+		transientWait, _ := isTransientPlatformUnavailableError(herr)
+		var se *benchmark.StructuredError
+		isClientErr := errors.As(herr, &se) && se.HTTPStatus >= 400 && se.HTTPStatus < 500 && se.HTTPStatus != http.StatusTooManyRequests
+		if transientWait == 0 && (isClientErr || strings.Contains(herr.Error(), "不支持单独 hint 接口")) {
+			_ = bm.s.m.pg.SaveBenchmarkChallengeHint(ctx, sess.ID, ch.UniqueCode, "")
+			_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "hint_unavailable", "Worker 主动申请 Hint 但平台返回无可用 Hint："+herr.Error(), map[string]any{"reason": reason})
+			return "平台返回本题无可用 Hint（" + herr.Error() + "），已记录不再重复请求，请切换方向继续突破。", true, nil
+		}
+		return "", true, herr
+	}
+	cleanHint := strings.TrimSpace(hint)
+	_ = bm.s.m.pg.SaveBenchmarkChallengeHint(ctx, sess.ID, ch.UniqueCode, cleanHint)
+	if cleanHint == "" {
+		_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "hint_empty", "Worker 主动申请 Hint，题目未配置可用 Hint", map[string]any{"reason": reason, "elapsed_sec": int(elapsed.Seconds())})
+		return "本题平台未配置可用 Hint，已标记不再重复请求，请切换其他攻击面独立突破。", true, nil
+	}
+	_ = bm.s.m.pg.AppendBenchmarkEvent(ctx, sess.ID, ch.UniqueCode, "hint_fetched", "Worker 主动申请获取平台 Hint", map[string]any{
+		"source":      "active_worker_request",
+		"reason":      reason,
+		"hint":        cleanHint,
+		"elapsed_sec": int(elapsed.Seconds()),
+	})
+	if t, ok := bm.s.m.Task(strconv.FormatInt(taskID, 10)); ok {
+		_, _ = t.Store.AddNode("fact", map[string]any{
+			"summary": "【平台 Hint 提示】" + cleanHint,
+			"detail":  cleanHint,
+			"subtype": "benchmark_hint",
+		}, 0, "confirmed", "benchmark", nil)
+	}
+	return "【平台官方 Hint】" + cleanHint + "\n（已同步写入探索图谱，请立即按此线索调整利用路线）", true, nil
 }
 
 // resolveBenchmarkCTFCandidates closes pending 'candidate' rows in ctf_candidates

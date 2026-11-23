@@ -734,10 +734,10 @@ func TestHostedBenchmarkFirstPassScreening(t *testing.T) {
 		HintPolicy:          "stagnant_only",
 		PerChallengeTimeout: 5400,
 	}
-	// 1. Single-flag Attempt 1 uses 600s first-pass budget.
+	// 1. Single-flag Attempt 1 uses 1200s (20m) first-pass budget.
 	chFirst := &db.BenchmarkChallenge{UniqueCode: "single_1", FlagCount: 1, AttemptCount: 1}
-	if dur, fp := effectiveChallengeTimeout(sess, chFirst); !fp || dur != 600*time.Second {
-		t.Fatalf("expected 600s first-pass budget for Attempt 1 single-flag, got dur=%v fp=%v", dur, fp)
+	if dur, fp := effectiveChallengeTimeout(sess, chFirst); !fp || dur != 1200*time.Second {
+		t.Fatalf("expected 1200s first-pass budget for Attempt 1 single-flag, got dur=%v fp=%v", dur, fp)
 	}
 	// 2. Single-flag Attempt 2 uses full 5400s budget.
 	chSecond := &db.BenchmarkChallenge{UniqueCode: "single_1", FlagCount: 1, AttemptCount: 2}
@@ -834,5 +834,43 @@ func TestHostedBenchmarkFirstPassScreening(t *testing.T) {
 	// At 11m (>600s) with hasWaiting=true -> MUST rotate to let untried challenges run!
 	if rotated := s.bench.checkChallengeTimeoutAndHint(t.Context(), rt, dbSess, chLive, true); !rotated {
 		t.Fatal("expected first-pass rotation at 11m when waiting challenges exist")
+	}
+
+	// 6. Momentum Grace Window (+600s) & active benchmark_request_hint 8m anti-laziness gate:
+	_ = m.pg.SyncBenchmarkChallenges(t.Context(), dbSess.ID, []db.BenchmarkChallengeUpsert{{
+		UniqueCode: "grace_ch", Title: "grace_ch", Category: "pwn", TotalScore: 500, FlagCount: 1,
+	}})
+	graceTask, _ := m.CreateTaskWithOptions("grace_ch", "goal", db.TaskCreateOptions{Mode: "ctf", ChallengeType: "pwn", ZeroTouch: true})
+	t.Cleanup(func() { _, _ = m.DeleteTask(graceTask.ID, DeleteTaskOptions{}) })
+	graceTID, _ := strconv.ParseInt(graceTask.ID, 10, 64)
+	_ = m.pg.BindBenchmarkChallengeTask(t.Context(), dbSess.ID, "grace_ch", graceTID)
+
+	// (a) Active Hint request before 8m (at 3m) without stagnation must be rejected by the 8m gate.
+	rt.taskStartAt["grace_ch"] = time.Now().Add(-3 * time.Minute)
+	hintMsg, handled, herr := s.bench.handleRequestHint(t.Context(), graceTID, "trying early hint")
+	if herr != nil || !handled || !strings.Contains(hintMsg, "Hint 门禁拦截") || hintCalls != 0 {
+		t.Fatalf("expected 8m gate rejection without calling platform /hint, got msg=%q handled=%v err=%v calls=%d", hintMsg, handled, herr, hintCalls)
+	}
+
+	// (b) Record a fresh confirmed Fact (active solving momentum) and advance clock to 11m (>600s first-pass):
+	//     checkChallengeTimeoutAndHint must grant +600s Momentum Grace instead of rotating!
+	_, _ = graceTask.Store.AddNode("fact", map[string]any{"summary": "leaked libc base 0x7f..."}, 0, "confirmed", "worker", nil)
+	rt.taskStartAt["grace_ch"] = time.Now().Add(-11 * time.Minute)
+	chGrace, _ := m.pg.GetBenchmarkChallenge(t.Context(), dbSess.ID, "grace_ch")
+	if rotated := s.bench.checkChallengeTimeoutAndHint(t.Context(), rt, dbSess, chGrace, true); rotated {
+		t.Fatal("expected Momentum Grace Window (+600s) to prevent rotation when recent fact exists")
+	}
+	if !rt.momentumGraceGranted["grace_ch"] {
+		t.Fatal("expected momentumGraceGranted[grace_ch]=true")
+	}
+
+	// (c) Active Hint request at 11m (>=8m) must succeed and write Hint Fact into graph, and second call must hit cache.
+	hintMsg2, handled2, herr2 := s.bench.handleRequestHint(t.Context(), graceTID, "stuck on gadget after 11m")
+	if herr2 != nil || !handled2 || !strings.Contains(hintMsg2, "some hint") || hintCalls != 1 {
+		t.Fatalf("expected active hint fetch after 8m to succeed, got msg=%q handled=%v err=%v calls=%d", hintMsg2, handled2, herr2, hintCalls)
+	}
+	hintMsg3, _, _ := s.bench.handleRequestHint(t.Context(), graceTID, "second call")
+	if !strings.Contains(hintMsg3, "已缓存") || hintCalls != 1 {
+		t.Fatalf("expected second hint request to hit cache without extra platform call, got msg=%q calls=%d", hintMsg3, hintCalls)
 	}
 }

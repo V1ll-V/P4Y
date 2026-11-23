@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"p3y/db"
@@ -24,20 +25,31 @@ type (
 // CTF workspace so noisy static analysis / brute-force / log parsing stays out of
 // Solver's primary context window.
 type CTFHelperRequest struct {
-	Goal        string `json:"goal"`
-	FocusPath   string `json:"focus_path,omitempty"`
-	SaveKitName string `json:"save_kit_name,omitempty"`
-	MaxTurns    int    `json:"max_turns,omitempty"`
+	Name        string             `json:"name,omitempty"`
+	Goal        string             `json:"goal"`
+	FocusPath   string             `json:"focus_path,omitempty"`
+	SaveKitName string             `json:"save_kit_name,omitempty"`
+	MaxTurns    int                `json:"max_turns,omitempty"`
+	Tasks       []CTFHelperRequest `json:"tasks,omitempty"`
 }
 
 // CTFHelperResult holds the condensed deliverable returned by Helper back to Solver.
 type CTFHelperResult struct {
+	Name           string `json:"name,omitempty"`
+	Goal           string `json:"goal,omitempty"`
 	Summary        string `json:"summary"`
 	FocusPath      string `json:"focus_path,omitempty"`
 	SaveKitName    string `json:"save_kit_name,omitempty"`
 	FactsRecorded  int    `json:"facts_recorded"`
 	TerminalReason string `json:"terminal_reason,omitempty"`
 	Error          string `json:"error,omitempty"`
+}
+
+// CTFHelperBatchResult aggregates results when ask_helper fans out multiple concurrent sub-tasks.
+type CTFHelperBatchResult struct {
+	Mode    string            `json:"mode"`
+	Count   int               `json:"count"`
+	Results []CTFHelperResult `json:"results"`
 }
 
 // CTFHelperRunner executes an ephemeral bounded Helper session.
@@ -89,12 +101,23 @@ func stripHelperTools(tools []actool.CoreTool) []actool.CoreTool {
 }
 
 func askHelperTool() actool.CoreTool {
-	return writeTool("ask_helper", "派出短生命周期、独立上下文的 Helper 帮手处理局部脏活（如海量反编译分析、流量/字典暴破、提取符号生成 interact.py），只带回浓缩结论而不污染当前 Solver 主上下文。", obj(map[string]any{
-		"goal":          str("交给 Helper 的单一明确目标（如 '使用 ctf_decompile 分析 /work/chall 的 menu/alloc/free 逻辑并把偏移汇总为 symbols.json'）"),
+	return writeTool("ask_helper", "派出 1 个或多个（最多 3 路并发）短生命周期、独立上下文的 Helper 子代理处理局部脏活（如并行审计多目录源码、同时反编译多个函数、流量/字典解析或脚手架生成），只带回浓缩结论而不污染 Lead-Solver 主上下文。单任务传 goal；并行多任务传 tasks 数组。", obj(map[string]any{
+		"goal":          str("单任务模式：交给 Helper 的明确目标（如 '使用 ctf_decompile 分析 /work/chall 的 menu/alloc/free 逻辑并把偏移汇总为 symbols.json'）"),
 		"focus_path":    str("可选焦点文件或目录路径（默认 /work）"),
 		"save_kit_name": str("可选要求 Helper 完成后调用 board_save_kit 沉淀的套件文件名（如 'symbols.json'、'interact.py'）"),
-		"max_turns":     intp("Helper 最大轮数预算（范围 2~8，默认 6）"),
-	}, "goal"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+		"max_turns":     intp("Helper 最大轮数预算（范围 2~12，默认 8）"),
+		"tasks": map[string]any{
+			"type":        "array",
+			"description": "并发子代理模式（最多 3 个互不依赖的并行子任务，如同时审计 Web 后端源码 + 检查前端路由 + 分析配置文件）",
+			"items": obj(map[string]any{
+				"name":          str("子任务简短标签（如 'audit_auth'、'decompile_vm'）"),
+				"goal":          str("该子代理的明确目标"),
+				"focus_path":    str("可选焦点路径"),
+				"save_kit_name": str("可选沉淀套件文件名"),
+				"max_turns":     intp("该子代理轮数上限（2~12，默认 8）"),
+			}, "goal"),
+		},
+	}), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		if isCTFHelperContext(ctx) {
 			return actool.Errorf("Helper 不能嵌套调用 ask_helper"), nil
 		}
@@ -106,9 +129,62 @@ func askHelperTool() actool.CoreTool {
 		if err := json.Unmarshal(in, &req); err != nil {
 			return actool.Errorf(fmt.Sprintf("参数解析失败: %v", err)), nil
 		}
+		if len(req.Tasks) > 0 {
+			const maxParallelHelpers = 3
+			tasks := make([]CTFHelperRequest, 0, min(len(req.Tasks), maxParallelHelpers))
+			for i, sub := range req.Tasks {
+				if len(tasks) >= maxParallelHelpers {
+					break
+				}
+				sub.Goal = strings.TrimSpace(sub.Goal)
+				if sub.Goal == "" {
+					continue
+				}
+				if strings.TrimSpace(sub.Name) == "" {
+					sub.Name = fmt.Sprintf("sub#%d", i+1)
+				}
+				if sub.FocusPath == "" {
+					sub.FocusPath = req.FocusPath
+				}
+				if sub.MaxTurns == 0 {
+					sub.MaxTurns = req.MaxTurns
+				}
+				tasks = append(tasks, sub)
+			}
+			if len(tasks) == 0 {
+				return actool.Errorf("tasks 中至少需要 1 个非空 goal"), nil
+			}
+			results := make([]CTFHelperResult, len(tasks))
+			var wg sync.WaitGroup
+			for i, sub := range tasks {
+				wg.Add(1)
+				go func(idx int, item CTFHelperRequest) {
+					defer wg.Done()
+					res, err := runner(ctx, item)
+					if err != nil {
+						res = CTFHelperResult{Name: item.Name, Goal: item.Goal, Error: err.Error()}
+					} else {
+						if res.Name == "" {
+							res.Name = item.Name
+						}
+						if res.Goal == "" {
+							res.Goal = item.Goal
+						}
+					}
+					results[idx] = res
+				}(i, sub)
+			}
+			wg.Wait()
+			b, _ := json.Marshal(CTFHelperBatchResult{
+				Mode:    "parallel",
+				Count:   len(results),
+				Results: results,
+			})
+			return actool.Text(string(b)), nil
+		}
 		req.Goal = strings.TrimSpace(req.Goal)
 		if req.Goal == "" {
-			return actool.Errorf("goal 不能为空"), nil
+			return actool.Errorf("goal 或 tasks 不能为空"), nil
 		}
 		res, err := runner(ctx, req)
 		if err != nil {
@@ -125,13 +201,13 @@ func (w *Worker) runCTFHelper(ctx context.Context, as *db.AssetStore, ts *db.Exp
 	}
 	turns := req.MaxTurns
 	if turns <= 0 {
-		turns = 6
+		turns = 8
 	}
 	if turns < 2 {
 		turns = 2
 	}
-	if turns > 8 {
-		turns = 8
+	if turns > 12 {
+		turns = 12
 	}
 
 	tsx := NewToolSet(ts, "helper")

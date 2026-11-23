@@ -923,6 +923,25 @@ func shouldSkipHeartbeatForPausedIntents(store *db.ExplorationStore) bool {
 	return hasPaused
 }
 
+// shouldSkipHeartbeatForCTFRunning suppresses periodic heartbeat Planner LLM calls
+// while a CTF Lead-Solver Worker is actively executing. The Planner still wakes
+// immediately on edge events (worker completion/exhaustion, hints, or rejections).
+func shouldSkipHeartbeatForCTFRunning(store *db.ExplorationStore) bool {
+	if store == nil {
+		return false
+	}
+	intents, err := store.ListByKind(db.KindIntent, 200)
+	if err != nil {
+		return false
+	}
+	for _, it := range intents {
+		if it.State == "running" {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	interval := plannerHeartbeatInterval(t)
 	// 心跳定时器在 loop 入口臂 = 从任务 start 计时:即使是跳过首轮 planner 的 seed 任务
@@ -988,8 +1007,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			}
 			return // goalless 分支永不进入 planner.Plan
 		}
-		// 只有 paused 意图（无 open/running）时，跳过周期心跳规划，避免用户手工接管期间空唤醒 Planner。
-		if src == "heartbeat" && shouldSkipHeartbeatForPausedIntents(t.Store) {
+		// 只有 paused 意图（无 open/running）时，或 CTF 主攻 Worker 正在活跃运行时，
+		// 跳过周期心跳规划，避免空唤醒 Planner 浪费 Token 与干扰长程主攻心流。
+		if src == "heartbeat" && (shouldSkipHeartbeatForPausedIntents(t.Store) || (t.Mode == "ctf" && shouldSkipHeartbeatForCTFRunning(t.Store))) {
 			return
 		}
 		if !e.beginTaskOperation(t.ID) {

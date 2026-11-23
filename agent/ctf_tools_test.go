@@ -420,3 +420,79 @@ func TestRenderIntentSecondaryTipsRecallsWithoutDupOrHitBump(t *testing.T) {
 		}
 	}
 }
+
+func TestParallelAskHelperAndDeterministicCriticAndGraphDenoise(t *testing.T) {
+	// 1. Lead-Solver floor in ctfMaxTurnsForPhase
+	if got := ctfMaxTurnsForPhase(true, "exploit", 24); got != 80 {
+		t.Fatalf("expected exploit phase maxTurns floor 80, got %d", got)
+	}
+	if got := ctfMaxTurnsForPhase(true, "exploit", 96); got != 96 {
+		t.Fatalf("expected exploit phase maxTurns 96 preserved, got %d", got)
+	}
+
+	// 2. Parallel ask_helper(tasks=[...]) fan-out
+	tl := askHelperTool()
+	ctx := WithCTFHelperRunner(t.Context(), func(_ context.Context, req CTFHelperRequest) (CTFHelperResult, error) {
+		return CTFHelperResult{
+			Summary:       "done:" + req.Goal,
+			FocusPath:     req.FocusPath,
+			FactsRecorded: 1,
+		}, nil
+	})
+	rawIn := json.RawMessage(`{
+		"tasks": [
+			{"name": "route_a", "goal": "audit /api/login", "focus_path": "/work/app"},
+			{"name": "route_b", "goal": "audit /api/admin", "focus_path": "/work/admin"},
+			{"name": "crypto_c", "goal": "recover jwt secret"}
+		]
+	}`)
+	res, err := tl.Call(ctx, rawIn, nil)
+	if err != nil || res.IsError {
+		t.Fatalf("parallel ask_helper failed: res=%+v err=%v", res, err)
+	}
+	var batch CTFHelperBatchResult
+	if len(res.Content) == 0 {
+		t.Fatal("expected non-empty content block from parallel ask_helper")
+	}
+	if err := json.Unmarshal([]byte(res.Content[0].Text), &batch); err != nil {
+		t.Fatalf("unmarshal batch result: %v (%s)", err, res.Content[0].Text)
+	}
+	if batch.Mode != "parallel" || batch.Count != 3 || len(batch.Results) != 3 {
+		t.Fatalf("expected 3 parallel helper results, got %+v", batch)
+	}
+	if batch.Results[0].Name != "route_a" || batch.Results[1].Summary != "done:audit /api/admin" {
+		t.Fatalf("unexpected parallel helper result ordering/content: %+v", batch.Results)
+	}
+
+	// 3. Zero-LLM deterministic Critic advice across failure classes
+	hooks := newCTFCriticHooks(nil, nil, nil, 0, 0, nil)
+	for i := 0; i < 3; i++ {
+		hooks.PostToolUse(t.Context(), "Bash", []byte(`{"command":"python3 exp.py"}`), []byte(`{"exit_code":139,"stderr":"Segmentation fault (core dumped)"}`), false)
+	}
+	blocked, msg, _ := hooks.PreToolUse(t.Context(), "Bash", []byte(`{"command":"python3 exp.py"}`))
+	if !blocked || !strings.Contains(msg, "MOVAPS") || !strings.Contains(msg, "diff_local_remote") {
+		t.Fatalf("expected 0-LLM deterministic crash/MOVAPS advice on 3rd segfault, got blocked=%v msg=%q", blocked, msg)
+	}
+
+	// 4. CTF Graph Overview denoising
+	sampleOverview := map[string]any{
+		"goals":                     []string{"get flag"},
+		"facts":                     2,
+		"recent_facts":              []map[string]any{{"id": 1, "summary": "precheck", "detail": "ELF 64-bit", "evidence": "NX enabled"}},
+		"findings_total":            0,
+		"candidates_total":          0,
+		"finding_list":              []any{},
+		"awaiting_goal_evaluations": 0,
+		"coverage":                  map[string]any{"host_count": 0},
+		"paused_intents_total":      0,
+	}
+	rendered := renderWorkerGraphOverview(sampleOverview, true)
+	for _, banned := range []string{"findings_total", "candidates_total", "finding_list", "awaiting_goal_evaluations", "coverage"} {
+		if strings.Contains(rendered, banned) {
+			t.Fatalf("expected CTF graph overview to strip enterprise field %q, got:\n%s", banned, rendered)
+		}
+	}
+	if !strings.Contains(rendered, "ELF 64-bit") || !strings.Contains(rendered, "paused_intents_total") {
+		t.Fatalf("expected inline fact detail and paused_intents_total retained, got:\n%s", rendered)
+	}
+}

@@ -452,6 +452,12 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// recent_facts：非折叠事实里最新的一窗（≤N，factNodes 按 id 降序即最新在前）。已折进
 	// digest 且仍冷的（hidden）走 cold_digests，不在此重复。每条 {id, summary, from_intent?,
 	// confidence?}；evidence 等详情用 node_detail(id)。更早的用 list_facts 翻。
+	isCTFMode := false
+	if t.ts != nil {
+		if mode, _, _, merr := t.ts.TaskInputMetadata(); merr == nil && mode == "ctf" {
+			isCTFMode = true
+		}
+	}
 	const recentFactsCap = 20
 	recentFacts := make([]map[string]any, 0, recentFactsCap)
 	for _, n := range factNodes {
@@ -466,11 +472,19 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			m["from_intent"] = from // 本事实由哪个意图产生
 		}
 		// confidence 带进概览：让规划者一眼看出哪条结论只是 inferred（尤其否定结论
-		// 别当铁案）；evidence 较长，留给 node_detail(id)。
+		// 别当铁案）；CTF 模式下同步内联 detail(≤500字) 与 evidence(≤200字)，消除 node_detail 盲查往返。
 		var fp map[string]any
 		if json.Unmarshal(n.Payload, &fp) == nil {
 			if c, ok := fp["confidence"].(string); ok && c != "" {
 				m["confidence"] = c
+			}
+			if isCTFMode {
+				if det, ok := fp["detail"].(string); ok && strings.TrimSpace(det) != "" {
+					m["detail"] = singleLineTrunc(det, 500)
+				}
+				if ev, ok := fp["evidence"].(string); ok && strings.TrimSpace(ev) != "" {
+					m["evidence"] = singleLineTrunc(ev, 200)
+				}
 			}
 		}
 		recentFacts = append(recentFacts, m)

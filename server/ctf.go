@@ -126,7 +126,7 @@ func (s *Server) decideCTFFlag(w http.ResponseWriter, r *http.Request) {
 		State        string `json:"state"`
 		Notes        string `json:"notes"`
 		Revision     int64  `json:"revision"`
-		CompleteTask bool   `json:"complete_task"`
+		CompleteTask *bool  `json:"complete_task"`
 	}
 	if err = json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
 		writeErr(w, 400, "请求无效")
@@ -137,7 +137,15 @@ func (s *Server) decideCTFFlag(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, err.Error())
 		return
 	}
-	c, err := s.m.DecideCTFAnswer(r.Context(), t, id, in.Revision, in.State, in.Notes, in.CompleteTask)
+	completeTask := false
+	if in.CompleteTask != nil {
+		completeTask = *in.CompleteTask
+	} else if in.State == "accepted" {
+		if vm, verr := s.m.pg.TaskCTFVerifyMode(r.Context(), task); verr == nil && vm == "flag" {
+			completeTask = true
+		}
+	}
+	c, err := s.m.DecideCTFAnswer(r.Context(), t, id, in.Revision, in.State, in.Notes, completeTask)
 	if err != nil {
 		writeErr(w, 409, err.Error())
 		return

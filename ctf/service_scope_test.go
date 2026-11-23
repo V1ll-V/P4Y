@@ -279,3 +279,61 @@ func TestSeedNonSharedWorkDirInheritsNamedScriptsAndAncestors(t *testing.T) {
 		t.Fatalf("default scratch solve.py should still be skipped")
 	}
 }
+
+func TestSharedScopeRetryInheritsAncestorWorkAndScriptSnapshotCache(t *testing.T) {
+	root := t.TempDir()
+	// Ancestor Pwn task (#201) wrote exp.py and patched binary into shared/ctf-work.
+	ancShared := filepath.Join(root, "tasks", "201", "shared", "ctf-work")
+	if err := os.MkdirAll(ancShared, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ancShared, "exp.py"), []byte("from pwn import *\nprint('pwn_v1')\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ancShared, "chall_patched"), []byte("ELF_PATCHED"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Retry Pwn task (#202) prepares its shared/ctf-work directory for the first time.
+	retryShared := filepath.Join(root, "tasks", "202", "shared", "ctf-work")
+	seedNonSharedWorkDir(root, 202, retryShared, 201)
+
+	gotExp, err := os.ReadFile(filepath.Join(retryShared, "exp.py"))
+	if err != nil || !strings.Contains(string(gotExp), "pwn_v1") {
+		t.Fatalf("expected Pwn retry shared/ctf-work to inherit ancestor exp.py, got %q (%v)", string(gotExp), err)
+	}
+	if _, err := os.Stat(filepath.Join(retryShared, "chall_patched")); err != nil {
+		t.Fatalf("expected Pwn retry shared/ctf-work to inherit chall_patched: %v", err)
+	}
+
+	// Verify incremental snapshotScriptsCached reuses snapshot when unchanged and refreshes on edit.
+	svc := &Service{Root: root}
+	execDir1 := filepath.Join(root, "tasks", "202", "ctf", "executions", "exec-1")
+	execDir2 := filepath.Join(root, "tasks", "202", "ctf", "executions", "exec-2")
+	execDir3 := filepath.Join(root, "tasks", "202", "ctf", "executions", "exec-3")
+	for _, d := range []string{execDir1, execDir2, execDir3} {
+		if err := os.MkdirAll(d, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s1, err := svc.snapshotScriptsCached(202, retryShared, execDir1)
+	if err != nil || len(s1) != 1 || s1[0].Name != "exp.py" {
+		t.Fatalf("expected 1 snapshotted script in exec-1, got %+v (%v)", s1, err)
+	}
+	// Second read-only tool execution with no script modification must reuse exec-1 snapshot path without writing to exec-2.
+	s2, err := svc.snapshotScriptsCached(202, retryShared, execDir2)
+	if err != nil || len(s2) != 1 || s2[0].Path != s1[0].Path || s2[0].SHA256 != s1[0].SHA256 {
+		t.Fatalf("expected unchanged /work to reuse cached script snapshot, got s1=%+v s2=%+v", s1, s2)
+	}
+	if _, err := os.Stat(filepath.Join(execDir2, "script-01.py")); !os.IsNotExist(err) {
+		t.Fatalf("expected no duplicate script copy in exec-2 on cache hit")
+	}
+	// Modifying exp.py must invalidate the signature cache and write a fresh snapshot to exec-3.
+	if err := os.WriteFile(filepath.Join(retryShared, "exp.py"), []byte("from pwn import *\nprint('pwn_v2_updated')\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s3, err := svc.snapshotScriptsCached(202, retryShared, execDir3)
+	if err != nil || len(s3) != 1 || s3[0].SHA256 == s1[0].SHA256 || !strings.Contains(s3[0].Path, "exec-3") {
+		t.Fatalf("expected modified exp.py to produce fresh snapshot in exec-3, got %+v", s3)
+	}
+}

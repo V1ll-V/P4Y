@@ -1,82 +1,75 @@
-# P3Y
+# P4Y
 
-面向渗透测试、CTF 自动求解、Attack-Defense 实时攻防与多平台自动化测评的安全智能体系统。核心由 **Go 控制面（`cmd/p3y`）**、**物理隔离沙箱执行器（`cmd/p3y-box`）** 与 **嵌入式控制台（`web/`）** 组成，围绕“控制面与执行面解耦、图谱黑板持久化状态、0-LLM 确定性预处理与单模型攻坚纠偏”构建。
+**P4Y** 是继承自 **P3Y** 项目并围绕 **第一性原理（First Principles）** 与 **“Less is More”** 理念完成深度重构的新一代自主攻防与 CTF 解题智能体系统。
+
+系统面向 **CTF 自动求解**、**多阶段内网渗透**、**Attack-Defense 实时攻防** 与 **多平台零交互自动化测评（Hosted Benchmark）**，核心由 **Go 控制面（`cmd/p3y`）**、**物理隔离沙箱执行器（`cmd/p3y-box` / 本地无 Docker 沙箱）** 与 **嵌入式控制台（`web/`）** 组成。
+
+---
+
+## P4Y 相对 P3Y 的核心演进
+
+在完整继承 P3Y 探索图黑板、沙箱物理隔离、VPN Sidecar 复用、TipCard 避坑卡与多平台测评基础设施的基础上，P4Y 针对端到端解题速度、推理连续性与多阶段吞吐完成了四大架构级重构：
+
+1. **0-LLM 直通车 `Lead-Solver` + 弹性三层多智能体架构**：
+   - **首动延迟归零**：CTF / 沙箱任务跳过 `Round-0 Goals LLM` 与 `Round-1 Planner LLM`，在 0-LLM `Phase-0 Precheck` 完成后直接点火长程主攻手 `Lead-Solver`（默认 `80+` 轮 / `20~30` 分钟连续会话），Turn 1 直发沙箱探测命令。
+   - **三层按需伸缩**：
+     - **L1 单兵直通层**：单题与多阶段外网破冰期由单个连续会话一气呵成，消灭 `Recon → Planner → Exploit` 交接失忆；
+     - **L2 内生并行层**：主攻手内部通过升级版 `ask_helper(tasks=[...])` 可随时并发扇出最多 **3 路**短周期子代理，共享 `/work` 完成重型审计与并行分析而不污染主上下文；
+     - **L3 战略分兵层**：主攻运行期间静默 Planner 周期心跳空转（0 次无效 heartbeat 唤醒），仅在边沿事件（阶段 Flag 验真、单路耗尽、收到 Hint、候选打回）时唤醒 Planner 进行多目标分兵与 `steer_work` 实时纠偏。
+2. **全模式 `/work` 跨轮继承 + 热路径 I/O 降载**：
+   - 统一共享模式（`pwn` / `reverse`）与隔离模式（`web` / `misc` / `crypto`）的祖先任务产物合并逻辑，二轮重跑 100% 继承前序 `/work/exp.py`、`*_patched` 等持久化产物。
+   - 引入任务级 `Sync` 内存缓存（`ensureSynced`）与基于 `(relPath, size, mtime)` 签名的脚本增量快照缓存（`snapshotScriptsCached`），消除只读工具调用时的重复预检与全盘 32 文件拷贝哈希开销。
+3. **0-LLM 确定性 `Critic` + 高信噪比 CTF 图谱与跨界零轮次工具解锁**：
+   - 将原 20 秒同步阻塞式 `Critic LLM` 替换为 **0-LLM、0ms 确定性特征诊断引擎**（精准识别 `502/断连`、`SIGSEGV/EOF/MOVAPS`、HTTP 403/404 盲扫与长停滞），绝不打断正常利用调试心流。
+   - CTF 图谱视图彻底剥离企业渗透专属空字段（`findings_total`、`candidates_total`、`finding_list`、`coverage` 等），并在 `recent_facts` 中**直接内联 `detail`（≤500字）与 `evidence`（≤200字）**，免除二次 `node_detail` 盲查。
+   - 基于 Phase-0 Precheck 检出的跨界特征（如 Web 题含 ELF/PCAP、Pwn 题含 HTTP 靶机）在 Turn 1 自动预解锁对应领域工具包，消除跨界工具解锁轮次税；同时植入「双面锚定法则（`[LIVE TARGET PRESENT]`）」，强制有活体靶机时前 3 轮完成活体实测验证。
+4. **托管测评续航升级与受控主动 Hint**：
+   - 托管模式首轮预算上调至 **`1200s`（20 分钟）**，并新增 **临门一脚动量延时（Momentum Grace Window）**：到达超时点时若已获部分 Sub-Flag 或近 3 分钟内有新确认 Fact 产出，自动宽限 **`+600s`** 避免临门错杀。
+   - 新增带 **8 分钟防偷懒硬门禁** 的主动 `benchmark_request_hint` 工具（全局幂等缓存并自动写回图谱），帮助模型在真正卡死于脑洞/隐藏条件时及时破局。
 
 ---
 
 ## 系统架构
 
 ```text
-  浏览器控制台 (Next.js, embedui)
+  浏览器控制台 (Next.js, embedui) / 无头托管模式 (P3Y_HEADLESS=1)
                │  HTTP / SSE / JWT
                ▼
-  ┌───────────────────────────────────────────────┐
-  │ cmd/p3y 控制面                                 │
-  │  ├── 调度引擎: Planner / Worker / 优雅超时收尾  │
-  │  ├── 业务域:   CTF / AD / Benchmark / Intercept │
-  │  ├── LLM 池:   多 Profile Failover + llmrec 审计│
-  │  ├── MITM代理: 127.0.0.1:8788 流量捕获与取证    │
-  │  └── PostgreSQL: 探索图 / 看板 / 任务 / 存档快照 │
-  └──────────────────────┬────────────────────────┘
-                         │  HTTP + Bearer Token（无 Docker Socket）
-                         ▼
-  ┌───────────────────────────────────────────────┐
-  │ cmd/p3y-box 执行面（独立守护进程）              │
-  │  ├── 工具容器: /work (rw) + /work/.inputs (ro)  │
-  │  ├── 交互/作业: PTY 伪终端、后台任务与超时隔离    │
-  │  ├── 快照引擎: /work 硬链接 Savepoint / Rewind  │
-  │  └── VPN 网关:  p3y-box-vpn-<hash> 共享隧道     │
-  └───────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │ cmd/p3y 控制面                                            │
+  │  ├── 弹性调度引擎: Direct Lead-Solver / Edge Planner      │
+  │  ├── 并行协查与督导: ask_helper(tasks[]) / 0-LLM Critic   │
+  │  ├── 业务域:       CTF / AD / Benchmark / Intercept       │
+  │  ├── LLM 池:       多 Profile Failover + llmrec 全量审计  │
+  │  ├── MITM 代理:    127.0.0.1:8788 流量捕获与取证          │
+  │  └── PostgreSQL:   探索图 / 看板 / TipCard / 任务与快照   │
+  └──────────────────────────┬───────────────────────────────┘
+                             │  HTTP + Bearer Token（或单容器 LocalBackend）
+                             ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ 隔离执行面（cmd/p3y-box 守护进程 / 单容器本地沙箱）        │
+  │  ├── 工具容器: /work (rw 持久继承) + /work/.inputs (ro)   │
+  │  ├── 交互/作业: PTY 伪终端、PyREPL、后台长作业与超时隔离  │
+  │  ├── 快照引擎: /work 硬链接 Savepoint / Rewind            │
+  │  └── VPN 网关: p3y-box-vpn-<hash> 同配置共享隧道          │
+  └──────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 核心设计与结构特点
-
-### 1. 控制面与沙箱物理隔离
-- **最小权限边界**：主服务 `p3y` 本身不挂载宿主机 `/var/run/docker.sock`，所有容器生命周期、命令执行与网络挂载均通过令牌鉴权的 `p3y-box`（`ctfrunner`）代理完成；工作容器默认按受限资源与非特权参数启动。
-- **Bind-Mount 持久卷直挂**：任务工作区直接绑定到容器 `/work`，原始题目附件以只读模式挂载至 `/work/.inputs`，消除每次执行全量打包拷贝的延迟、体积限制和并发竞态。
-- **同配置共享 VPN Sidecar**：支持 WireGuard（`.conf`）与 OpenVPN（`.ovpn`），并按配置内容 SHA-256 哈希在同配置并发任务间复用同一个 `p3y-box-vpn-<hash[:16]>` 隧道容器（串行建链与健康探测，全部关联容器退出后再回收），避免同一客户端证书多任务并发拨号互踢。
-
-### 2. 图谱黑板驱动的多轮推进与跨任务继承
-- **状态落在探索图而不是堆在单轮上下文里**：引擎将目标（`goal`）、约束/提示（`hint`）、子意图（`intent`）、客观事实（`fact`）、漏洞结论（`finding`）与冷折叠摘要（`digest`）持久化于 PostgreSQL（`db.ExplorationStore`），Worker 按轮领取轻量意图并写回结构化节点，避免单条长对话爆炸导致失忆或偏航。
-- **渐进式披露与冷图压缩**：看板与探索记录严格区分 **L1 标题 / L2 摘要 / L3 全文详情（`board_read_detail`）**；冷图折叠（`agent/coldgraph.go`）与可选 `noa` 压缩把过期细节收拢到节点详情中；旁路问答（`sidequestion`）在不打断主任务步进的前提下响应异步追问。
-- **只读血缘继承（`SourceTaskIDs`）**：新任务可声明继承前序任务的只读黑板视图，直接查阅其已确认资产、漏洞事实、冷摘要与终态意图总结，但保留边界隔离（源任务节点只读，不混淆当前任务的写权限与执行路径）。
-- **多源模型高可用（`llmpool`）与审计（`llmrec`）**：支持任务级多 LLM Profile 顺序故障切换、建连/流式退避重试、以及任务级预算超时时的优雅收尾机制；所有原生 LLM 请求与响应持久化落库 `llm_records` 便于排查。
-
-### 3. CTF 单模型攻坚闭环（初检 / 快照回滚树 / 旁路协查 / 反向证伪）
-围绕复杂单题（尤其是 Pwn / Reverse / 复杂 Web）设计了一套确定性验真与防陷入死胡同机制：
-- **Phase-0 零消耗初检与 `TipCard` 经验结晶**：起跑前用确定性脚本提取附件哈希、架构、ELF/PE 保护位（NX / Canary / PIE / RELRO 等）与目标地址（`ctf/precheck.go`）；按特征标签召回历史跨题避坑卡注入开局；验收完成后由 `CrystallizeTips` 自动将有效解法与避坑经验沉淀为新 `TipCard`。
-- **动静合一主攻 + 旁路协查（`ask_helper`）**：针对 Pwn/Reverse，Planner 在轻量 `recon` 后仅派发 **1 个动静合一主攻 Worker** 在共享 `/work` 与连续上下文中打通静态分析、GDB 调试与利用；重型反编译、海量符号提取或编写交互脚本 `interact.py` 等脏活通过 `ask_helper`（`agent/helper.go`）派给短生命周期临时会话处理，只带回浓缩结论与落盘脚本，不污染主攻上下文。
-- **Savepoint / Rewind / Deadend 状态树与停滞分叉（`plateau_fork`）**：突破关键里程碑且经过 0-LLM `check_cmd` 验真后，调用 `board_mark_savepoint` 冻结 `/work` 硬链接快照并使用 `board_save_kit` 沉淀套件；分支走死时调用 `board_rewind` 原子回滚工作区，并在该存档点下追加单行 `Deadend` 负向约束（`agent/board_tools.go`）。同一存档点回滚达 `2` 次即判定停滞，触发 `plateau_fork`（`agent/plateau_fork.go`）在 `/work/.forks/...` 隔离工作区并发跑 `2~3` 条竞争假设分支并合入胜出者。
-- **连续失败自动证伪（`Critic`）与神经符号工具**：`ctfCriticHooks`（`agent/critic.go`）监控核心执行工具，**连续 3 次失败后自动拦截盲目微调参数并插入 1 轮反向证伪审讯**，指出最可能假的前提并要求执行最小对照实验，例如本地/远端行为与 Hex 对齐工具 **`diff_local_remote`**、Web 批量差分聚类工具 **`http_fuzz_diff`**、以及持久化符号计算环境 **`PyREPL`**（`ctf/pyrepl.go`、`agent/neuro_tools.go`）。
-- **因果裁剪战报（`ctf/wp.go`）**：基于真实命令记录与探索图谱证据链生成 Write-up，自动剪除已 `Rewind` 放弃的试错噪音。
-
-### 4. 多平台零交互自动化测评（`benchmark` + `server/benchmark.go`）
-- **多平台统一接入**：原生支持 **TSecBench（REST + `.ovpn`）**、**CTF2 / DASCTF（MCP）** 与 **Generic MCP（自定义 MCP + `Skill.zip` 注入）**。
-- **资源与状态调度闭环**：自动同步题库与附件、管控平台并发容器配额、主动探测并回收残留环境、容器临近过期时自动续期，并在平台限流/维护时进入全局冷却。
-- **超时/异常自动冷却重试 + 跨轮记忆继承**：默认单题预算 `5400s`（90 分钟，创建前与运行中均可通过 `PATCH /api/benchmarks/{id}` 动态调整）；遇到预算超时或靶场/子任务异常时，进入阶梯冷却（`30s -> 60s -> 120s`，上限 3 次）后自动重新入队，重开子任务通过 `history_task_ids -> SourceTaskIDs` 自动继承前序任务的全部黑板探索记忆；所有测评子任务同时在「任务」列表中可见并携带 `测评 #N` 跳转标记，方便独立审计。
-
-### 5. Attack-Defense 自主攻防（`ad`）与安全拦截（`intercept`）
-- **AD 引擎（`p3y/ad`）**：由态势推演 `Lead`、后台 0-LLM 并发定期打靶并内置失败熔断的 `Repeater`、对抓包与镜像流量进行常见利用载荷特征提取的 `Catcher`、以及在沙箱中同时验证补丁生效 + 服务 SLA 连通（`check_cmd`）+ PoC 阻断的 `Patcher` 组成。
-- **人工审批边界（`intercept`）**：支持按资产/规则匹配拦截敏感工具调用，挂起等待人工放行或超时兜底处理；支持内置 HTTP 抓包代理流量检索与证据联动（`traffic` / `evidence`）。
-
----
-
-## 目录结构速览
+## 核心模块与能力速览
 
 | 目录 | 职责 |
 | :--- | :--- |
 | `cmd/p3y` / `cmd/p3y-box` | 主控制面二进制入口 / 独立容器沙箱守护进程入口 |
-| `server/` | HTTP/SSE API 路由、任务与并发调度引擎（`engine.go`）、`BenchmarkManager` |
-| `agent/` | Planner / Worker 编排、工具目录、`Critic`、`ask_helper`、`plateau_fork`、`board_tools` |
-| `ctf/` / `ctfrunner/` | CTF Precheck、Tips 召回与结晶、`PyREPL`、WP 生成 / Docker 容器、Savepoint、VPN 引擎 |
-| `benchmark/` | TSecBench、CTF2 MCP、Generic MCP 适配器与 `Skill.zip` 解析器 |
+| `server/` | HTTP/SSE API 路由、事件驱动调度引擎（`engine.go`）、0-LLM 目标与主攻直发（`goals.go`）、`BenchmarkManager`（`benchmark.go`） |
+| `agent/` | Lead-Solver / Planner / 并发 `ask_helper` / 0-LLM `Critic` / 图谱与工具目录（`ctf_tools.go`、`toolcatalog.go`） |
+| `ctf/` / `ctfrunner/` | Phase-0 Precheck、动态二次 `TipCard` 召回与结晶、增量脚本快照与 `Sync` 缓存、`PyREPL`、WP 生成 / Docker 与本地无头沙箱引擎 |
+| `benchmark/` | TSecBench REST、CTF2 / DASCTF MCP、Generic MCP 适配器与 `Skill.zip` 解析器 |
 | `ad/` | Attack-Defense `Lead` / `Repeater` / `Catcher` / `Patcher` |
-| `db/` | PostgreSQL Schema 与迁移、探索图存储、只读源继承查询、测评及通知持久化 |
-| `llmpool/` / `llmrec/` | 多配置 LLM 健康度与 Failover 池 / 全量原生请求响应审计 |
-| `traffic/` / `intercept/` | MITM HTTP 抓包与归档 / 高危操作审批规则与上下文 |
-| `sidequestion/` / `notify/` | 异步旁路问答捕获 / 多渠道事件聚合投递 |
+| `db/` | PostgreSQL Schema 与迁移、探索图存储、只读血缘继承、测评与通知持久化 |
+| `llmpool/` / `llmrec/` | 多配置 LLM 健康度与 Failover 池 / 原生请求响应全量审计 |
+| `traffic/` / `intercept/` | MITM HTTP 抓包与归档 / 高危操作人工审批规则与上下文 |
 | `web/` | Next.js + React + Tailwind 前端控制台（支持静态导出并通过 `embedui` 嵌入二进制） |
 
 ---
@@ -89,45 +82,14 @@
 
 ---
 
-### 方式一：标准 Docker Compose 部署
+### 方式一：完整 CTF / AD / Benchmark 沙箱预览环境
 
-1. **配置环境变量**
+启用隔离沙箱执行器 `p3y-box`、全套 CTF 工具容器（含 Ghidra、radare2、pwntools、angr、python-sat、iproute2、flask-unsign、离线 glibc 池等）以及 WireGuard / OpenVPN Sidecar（编排文件：`docker-compose.ctf-preview.yml`）：
 
-   ```bash
-   cp .env.example .env
-   ```
-
-   编辑 `.env`，设置必填的 `POSTGRES_PASSWORD`；LLM Key 可填在环境变量中，也可留空并在首次登录后于控制台「系统 → LLM 配置」页面填写。
-
-2. **构建前端内嵌资源与服务端镜像**
+1. **构建主镜像与底层沙箱镜像**
 
    ```bash
-   cd web && npm ci && npm run build:static && cd ..
-   rm -rf server/webui/dist && cp -r web/out server/webui/dist
-
-   # 编译 Linux amd64 主二进制（arm64 请将 GOARCH 改为 arm64 并输出到 dist/arm64/p3y）
-   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -ldflags='-s -w' -o dist/amd64/p3y ./cmd/p3y
-   docker build -t p3y/p3y:latest .
-   ```
-
-3. **启动**
-
-   ```bash
-   docker compose up -d
-   ```
-
-   控制台访问 `http://localhost:8787`（内置抓包代理监听 `127.0.0.1:8788`）。
-
----
-
-### 方式二：完整 CTF / AD / Benchmark 沙箱环境
-
-启用隔离沙箱执行器 `p3y-box`、工具容器镜像以及 WireGuard / OpenVPN Sidecar（编排文件：`docker-compose.ctf-preview.yml`）：
-
-1. **构建主镜像、`p3y-box` 与底层容器镜像**
-
-   ```bash
-   # 1) 构建主应用镜像 p3y/p3y:v0.91
+   # 1) 构建前端并编译主二进制
    cd web && npm ci && npm run build:static && cd ..
    rm -rf server/webui/dist && cp -r web/out server/webui/dist
    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -ldflags='-s -w -X main.version=v0.91' -o dist/amd64/p3y ./cmd/p3y
@@ -145,7 +107,7 @@
    ```env
    P3Y_PREVIEW_DB_PASSWORD=change-me-strong-password
    P3Y_BOX_TOKEN=replace-with-at-least-24-chars-random-token
-   P3Y_CTF_FLAG_PREFIXES=flag,ctf,p3y
+   P3Y_CTF_FLAG_PREFIXES=flag,ctf,p4y
    ```
 
 3. **启动服务**
@@ -158,37 +120,24 @@
 
 ---
 
+### 方式二：单容器无头托管测评镜像（Hosted Benchmark）
+
+内置 PostgreSQL 16、本地无 Docker 沙箱（`P3Y_BOX_LOCAL=1`）、完整 CTF 工具链与离线武库种子，直接用于平台托管评测或离线单容器批测：
+
+```bash
+docker build -f Dockerfile.bench -t p3y-bench:latest .
+docker save p3y-bench:latest | gzip -1 > p3y-bench-hosted.tar.gz
+```
+
+---
+
 ### 方式三：本地源码开发与测试
 
-1. **配置 PostgreSQL 连接串**
+```bash
+# 配置独立测试数据库并运行全量单元测试
+export P3Y_PG_DSN="postgres://p3y:p3y@127.0.0.1:5432/p3y_test?sslmode=disable"
+go test -count=1 ./ctf/... ./ctfrunner/... ./agent/... ./server/... ./db/...
 
-   ```bash
-   export P3Y_PG_DSN="postgres://p3y:p3y@127.0.0.1:5432/p3y?sslmode=disable"
-   ```
-
-2. **启动开发服务**
-
-   ```bash
-   cd web && npm ci && cd ..
-
-   # 一键拉起后端 (:8787 / 代理 :8788) 与前端热更新 (:5173)
-   ./dev.sh
-   ```
-
-   如需本地联调沙箱执行器，可另开终端运行：
-
-   ```bash
-   go run ./cmd/p3y-box -addr 127.0.0.1:8790
-   ```
-
-   跨平台构建发布包可使用仓库内置脚本：`./build.sh` 或 `./build.sh --release`。
-
-3. **运行测试与前端校验**
-
-   ```bash
-   # 后端测试（需将 P3Y_PG_DSN 指向独立的测试数据库）
-   go test -p 1 -count=1 ./...
-
-   # 前端类型与静态导出构建
-   cd web && npx tsc --noEmit && npm run build:static
-   ```
+# 前端类型校验与静态导出构建
+cd web && npx tsc --noEmit && npm run build:static
+```

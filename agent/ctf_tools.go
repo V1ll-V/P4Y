@@ -37,6 +37,9 @@ type ctfDeferredVal struct {
 // BenchmarkChoiceHook submits objective choice-question answers on zero-touch benchmark tasks.
 var BenchmarkChoiceHook func(ctx context.Context, taskID int64, choices []string) (verdictJSON string, handled bool, err error)
 
+// BenchmarkHintHook handles active Worker requests for a platform Hint on zero-touch benchmark tasks.
+var BenchmarkHintHook func(ctx context.Context, taskID int64, reason string) (hintText string, handled bool, err error)
+
 // BenchmarkExtraToolsHook injects platform-specific safe MCP tools for a benchmark task.
 var BenchmarkExtraToolsHook func(ctx context.Context, taskID int64) []actool.CoreTool
 
@@ -133,6 +136,44 @@ func ctfBase(ctx context.Context, root string, ts *db.ExplorationStore, task, in
 	targets := []*actool.UnlockSet{unlock}
 	built := ctfToolsWithUnlock(service, task, intent, verifyMode, &targets)
 	activePack := ctfToolPackForChallenge(challenge)
+	activePacks := map[string]bool{}
+	if activePack != ctfPackAll {
+		activePacks[activePack] = true
+		// Zero-turn cross-domain auto-unlock: when Phase-0 Precheck detected
+		// cross-domain artifacts or targets (e.g., an ELF inside a Web task,
+		// an HTTP portal inside a Pwn task, or a PCAP inside a Misc/Web task),
+		// activate those packs immediately on Turn 1 without burning a turn on
+		// ctf_unlock_toolpack.
+		if preRaw, perr := ts.Database().TaskPrecheck(ctx, task); perr == nil && len(preRaw) > 0 {
+			var pre ctf.PrecheckResult
+			if json.Unmarshal(preRaw, &pre) == nil {
+				for _, f := range pre.Files {
+					k := strings.ToLower(strings.TrimSpace(f.Kind))
+					if k == "elf" || k == "pe" || k == "macho" {
+						activePacks[ctfPackBinary] = true
+					}
+					if k == "pcap" || strings.HasSuffix(strings.ToLower(f.Name), ".pcap") || strings.HasSuffix(strings.ToLower(f.Name), ".pcapng") {
+						activePacks[ctfPackCryptoMisc] = true
+					}
+				}
+				for _, tg := range pre.Targets {
+					if strings.HasPrefix(tg, "http://") || strings.HasPrefix(tg, "https://") {
+						activePacks[ctfPackWeb] = true
+					}
+				}
+				for _, tag := range pre.Tags {
+					switch strings.ToLower(strings.TrimSpace(tag)) {
+					case "pwn", "reverse", "elf", "pe":
+						activePacks[ctfPackBinary] = true
+					case "pcap":
+						activePacks[ctfPackCryptoMisc] = true
+					case "web", "php", "nodejs", "nextjs", "flask", "jinja2", "sql", "ssrf", "ssti", "jwt":
+						activePacks[ctfPackWeb] = true
+					}
+				}
+			}
+		}
+	}
 	packs := map[string][]string{}
 	var deferred []string
 	for _, tl := range built {
@@ -141,7 +182,7 @@ func ctfBase(ctx context.Context, root string, ts *db.ExplorationStore, task, in
 			continue
 		}
 		packs[pack] = append(packs[pack], tl.Name())
-		if activePack != ctfPackAll && pack != activePack {
+		if activePack != ctfPackAll && !activePacks[pack] {
 			deferred = append(deferred, tl.Name())
 		}
 	}
@@ -174,7 +215,7 @@ func stripCTFPlannerBase(base []actool.CoreTool) []actool.CoreTool {
 		switch name {
 		case "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS", "sleep", "graph_overview", "http_send",
 			"http_fuzz_diff", "http_race_probe", "diff_local_remote", "py_repl",
-			"ask_helper", "plateau_fork",
+			"ask_helper", "plateau_fork", "benchmark_request_hint", "benchmark_submit_choice",
 			"board_mark_savepoint", "board_rewind", "board_save_kit",
 			"report_finding", "update_finding_report":
 			continue
@@ -209,7 +250,7 @@ func ctfBaseForPlanner(ctx context.Context, ts *db.ExplorationStore, base []acto
 	return context.WithValue(ctx, ctfRunKey{}, true), filtered
 }
 
-var ctfExecutionTools = []string{"Bash", "Write", "Edit", "Grep", "Glob", "ctf_http", "http_fuzz_diff", "http_race_probe", "diff_local_remote", "py_repl", "ask_helper", "plateau_fork", "ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_decompile", "ctf_radare2", "Read", "LS", "ctf_tools", "ctf_unlock_toolpack", "ctf_run_background", "ctf_job_status", "ctf_job_stop", "ctf_probe_target", "ctf_session_start", "ctf_session_send", "ctf_session_read", "ctf_session_close", "ctf_pcap_analyze", "board_mark_savepoint", "board_rewind", "board_save_kit"}
+var ctfExecutionTools = []string{"Bash", "Write", "Edit", "Grep", "Glob", "ctf_http", "http_fuzz_diff", "http_race_probe", "diff_local_remote", "py_repl", "ask_helper", "plateau_fork", "benchmark_request_hint", "ctf_binary_info", "ctf_pwn_triage", "ctf_gdb", "ctf_decompile", "ctf_radare2", "Read", "LS", "ctf_tools", "ctf_unlock_toolpack", "ctf_run_background", "ctf_job_status", "ctf_job_stop", "ctf_probe_target", "ctf_session_start", "ctf_session_send", "ctf_session_read", "ctf_session_close", "ctf_pcap_analyze", "board_mark_savepoint", "board_rewind", "board_save_kit"}
 
 func buildCTFGDBScript(userCommands string) string {
 	const gdbTailPy = `python
@@ -320,8 +361,20 @@ end`
 
 func ctfCatalogTools() []actool.CoreTool {
 	out := []actool.CoreTool{}
+	extraCatalog := map[string]bool{
+		"py_repl":              true,
+		"http_fuzz_diff":       true,
+		"http_race_probe":      true,
+		"diff_local_remote":    true,
+		"ask_helper":           true,
+		"plateau_fork":         true,
+		"tips_search":          true,
+		"board_mark_savepoint": true,
+		"board_rewind":         true,
+		"board_save_kit":       true,
+	}
 	for _, t := range ctfTools(nil, 0, 0, "") {
-		if strings.HasPrefix(t.Name(), "ctf_") {
+		if strings.HasPrefix(t.Name(), "ctf_") || extraCatalog[t.Name()] {
 			out = append(out, t)
 		}
 	}
@@ -565,6 +618,23 @@ func ctfToolsWithUnlock(s *ctf.Service, task, intent int64, verifyMode string, u
 				return actool.Errorf("未找到对应的测评题提交处理器"), nil
 			}
 			return actool.Text("客观题提交判定结果：" + verdict), nil
+		}),
+		readTool("benchmark_request_hint", "专用于零交互自动测评：当你已完成活体靶机探测与常规排查、持续受阻（通常需运行满 8 分钟或进入停滞期）时，向赛台主动申请本题官方 Hint（全局幂等，若已拉取过则直接返回缓存；未满 8 分钟且未停滞时会被门禁拒绝以防无谓扣分）。", obj(map[string]any{
+			"reason": str("简述你已经排查的方向与当前卡点，说明为何需要官方 Hint"),
+		}, "reason"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a map[string]json.RawMessage
+			_ = json.Unmarshal(in, &a)
+			if BenchmarkHintHook == nil || s == nil || s.DB == nil || !s.DB.IsZeroTouchTask(task) {
+				return actool.Errorf("当前任务无外部测评赛台 Hint 接口可用"), nil
+			}
+			hintText, handled, err := BenchmarkHintHook(ctx, task, strings.TrimSpace(text(a, "reason")))
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if !handled {
+				return actool.Errorf("未找到对应的测评题 Hint 处理器"), nil
+			}
+			return actool.Text(hintText), nil
 		}),
 		writeTool("ctf_submit_exploit_proof", "专用于「无需 Flag、需平台裁判机验证」的漏洞利用证明类任务（exploit_proof / flag_and_exploit 第 2 阶段）：将真实执行结果作为利用证明提交，触发自动交接等待用户在赛题平台点击「验证漏洞利用」并确认通过。严禁用于传统仅提交 Flag 的题目，也不能凭空编造未执行的证明。", obj(map[string]any{
 			"execution_id":  str("完成并验证利用效果的真实执行 ID（必须有真实输出或脚本产物）"),
@@ -1026,7 +1096,7 @@ print("\n".join(out))`
 	filtered := make([]actool.CoreTool, 0, len(tools))
 	zeroTouch := s != nil && s.DB != nil && s.DB.IsZeroTouchTask(task)
 	for _, tl := range tools {
-		if tl.Name() == "benchmark_submit_choice" && !zeroTouch {
+		if (tl.Name() == "benchmark_submit_choice" || tl.Name() == "benchmark_request_hint") && !zeroTouch {
 			continue
 		}
 		if verifyMode == "ad_none" && (tl.Name() == "ctf_submit_flag" || tl.Name() == "ctf_submit_exploit_proof") {
@@ -1043,11 +1113,17 @@ print("\n".join(out))`
 	return filtered
 }
 
-// ctfRunBudgetForTask extends the per-intent wall-clock budget to 30m only for
-// non-recon intents inside multi-stage CTF tasks that have already verified at
-// least one stage flag, keeping single-flag and recon budgets unchanged.
+// ctfRunBudgetForTask ensures non-recon Lead-Solver intents have at least a 20m
+// continuous wall-clock budget (and 30m for multi-stage CTF tasks after the first
+// verified flag), while keeping recon intents bounded.
 func ctfRunBudgetForTask(ctx context.Context, workDir string, ts *db.ExplorationStore, taskID int64, phase string, base time.Duration) time.Duration {
-	if base <= 0 || base >= 30*time.Minute || phase == "recon" || ts == nil || taskID <= 0 {
+	if base <= 0 || phase == "recon" || ts == nil || taskID <= 0 {
+		return base
+	}
+	if base < 20*time.Minute {
+		base = 20 * time.Minute
+	}
+	if base >= 30*time.Minute {
 		return base
 	}
 	pg := ts.Database()

@@ -76,6 +76,13 @@ RUN /opt/ctf/pwn/bin/pip install --no-cache-dir -i https://pypi.tuna.tsinghua.ed
     && /opt/ctf/pwn/bin/python3 -c "from pysat.solvers import Cadical195" \
     && /opt/ctf/re/bin/python3 -c "from pysat.solvers import Cadical195" \
     && chmod -R a+rX /opt/ctf/pwn /opt/ctf/re
+# 内网路由探测（iproute2）与 Flask Session 伪造/破解常用件（置于末尾复用基础层缓存）
+RUN apt-get -o Acquire::http::Timeout=120 -o Acquire::Retries=5 update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -o Acquire::http::Timeout=120 -o Acquire::Retries=5 --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && /opt/ctf/pwn/bin/pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple flask itsdangerous flask-unsign \
+    && /opt/ctf/pwn/bin/python3 -c "import flask, itsdangerous; print('flask_ok')" \
+    && chmod -R a+rX /opt/ctf/pwn
 ENV PATH="/opt/ctf/pwn/bin:${PATH}" HOME=/work XDG_CACHE_HOME=/work/.cache XDG_CONFIG_HOME=/work/.config JAVA_TOOL_OPTIONS="-Duser.home=/work" PYTHONPYCACHEPREFIX=/tmp/pycache PWNLIB_NOTERM=1 TERM=dumb
 RUN useradd --uid 1000 --create-home ctf && mkdir -p /work && chown 1000:1000 /work
 USER 1000:1000
